@@ -1,0 +1,8 @@
+pyTelegramBotAPI==4.16.1
+Flask==3.0.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+
+# Optional: for Google Sheets API (if GOOGLE_SHEETS_USE_API=True)
+gspread>=6.0.0
+oauth2client>=4.1.3
