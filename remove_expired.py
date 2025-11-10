@@ -29,7 +29,10 @@ else:
         if ok:
             mark_subscription_expired(user_id, course_id)
             try:
-                bot.send_message(user_id, f"Доступ к курсу <b>{course_name}</b> завершен. Спасибо, что были с нами!", parse_mode="HTML")
+                # Strip HTML from course name (bot uses parse_mode=None)
+                from main import strip_html
+                clean_course_name = strip_html(course_name) if course_name else "курсу"
+                bot.send_message(user_id, f"Доступ к курсу {clean_course_name} завершен. Спасибо, что были с нами!")
             except Exception as e:
                 print(f"Notify user {user_id} failed: {e}")
             print(f"{datetime.now()}: Removed user {user_id} from {channel_id} ({course_id}).")

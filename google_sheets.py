@@ -60,11 +60,11 @@ def get_courses_data():
             channel = (d.get("channel") or d.get("Channel") or d.get("Канал") or "").strip()
             try:
                 price = float(str(price).replace(",", ".") if price else 0)
-            except:
+            except (ValueError, TypeError):
                 price = 0.0
             try:
                 duration = int(float(duration)) if duration else 0
-            except:
+            except (ValueError, TypeError):
                 duration = 0
             courses.append({
                 "id": course_id,

@@ -8,6 +8,12 @@ from dotenv import load_dotenv
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
 
+# Helper function to convert string "True"/"False" to boolean
+def get_bool_env(key: str, default: bool = False) -> bool:
+    """Get boolean from environment variable. Accepts 'true', 'True', 'TRUE', '1', etc."""
+    value = os.getenv(key, str(default))
+    return value.lower() in ("true", "1", "yes", "on")
+
 # === TELEGRAM ===
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TELEGRAM_BOT_TOKEN:
@@ -22,7 +28,7 @@ CURRENCY = os.getenv("CURRENCY", "RUB")
 
 # === PAYMENTS (Robokassa via Telegram Payments) ===
 # Feature flag to show Robokassa buttons/flows in the bot UI
-ENABLE_ROBOKASSA = os.getenv("ENABLE_ROBOKASSA", "False").lower() == "true"
+ENABLE_ROBOKASSA = get_bool_env("ENABLE_ROBOKASSA", False)
 # BotFather provider token for Robokassa
 # For TEST environment: Get test token from BotFather after connecting Robokassa test shop
 # For PRODUCTION: Get production token from BotFather after connecting Robokassa production shop
@@ -30,7 +36,7 @@ ENABLE_ROBOKASSA = os.getenv("ENABLE_ROBOKASSA", "False").lower() == "true"
 ROBOKASSA_PROVIDER_TOKEN = os.getenv("ROBOKASSA_PROVIDER_TOKEN", "")
 # Test mode flag (use test environment for development/testing)
 # Set to "True" to use test environment, "False" for production
-RBK_TEST_MODE = os.getenv("RBK_TEST_MODE", "True").lower() == "true"
+RBK_TEST_MODE = get_bool_env("RBK_TEST_MODE", True)
 # Receipt defaults tuned for self-employed (НПД). Adjust if ваш кейс требует иного:
 #   sno: one of ["osn","usn_income","usn_income_outcome","envd","esn","patent"]
 #   tax: 'none' for НПД (без НДС), or 'vat0', 'vat10', 'vat20', 'vat110', 'vat120'
@@ -53,7 +59,7 @@ GSHEET_COURSES_NAME = os.getenv("GSHEET_COURSES_NAME", "Courses")
 GSHEET_TEXTS_NAME = os.getenv("GSHEET_TEXTS_NAME", "Texts")
 
 # Set to True if you want to use Google API via service account (gspread). Otherwise we use CSV export.
-GOOGLE_SHEETS_USE_API = os.getenv("GOOGLE_SHEETS_USE_API", "False").lower() == "true"
+GOOGLE_SHEETS_USE_API = get_bool_env("GOOGLE_SHEETS_USE_API", False)
 GOOGLE_CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_FILE", "google_credentials.json")
 
 # === Admins ===
@@ -64,7 +70,7 @@ if not admin_ids_str:
 ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
 
 # === Webhook (PythonAnywhere) ===
-USE_WEBHOOK = os.getenv("USE_WEBHOOK", "False").lower() == "true"
+USE_WEBHOOK = get_bool_env("USE_WEBHOOK", False)
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "")
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")

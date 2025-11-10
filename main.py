@@ -31,24 +31,22 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=False)
 # Optional webhook-related config (can be provided via config.py or environment variables)
 try:
     from config import WEBHOOK_URL, WEBHOOK_PATH, WEBHOOK_SECRET_TOKEN, WEBHOOK_HOST
-    # If WEBHOOK_URL is not set but WEBHOOK_HOST is, construct it
-    if not WEBHOOK_URL or WEBHOOK_URL.startswith("https://<"):
-        if WEBHOOK_HOST and not WEBHOOK_HOST.startswith("<"):
-            if not WEBHOOK_PATH:
-                WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
-            if not WEBHOOK_PATH.startswith("/"):
-                WEBHOOK_PATH = "/" + WEBHOOK_PATH
-            WEBHOOK_URL = f"https://{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
 except ImportError:
-    WEBHOOK_URL = os.environ.get("WEBHOOK_URL")
-    WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", f"/{TELEGRAM_BOT_TOKEN}")
-    WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN")
-    WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST")
-    if not WEBHOOK_URL and WEBHOOK_HOST:
+    WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+    WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "")
+    WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN", "")
+    WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "")
+
+# If WEBHOOK_URL is not set but WEBHOOK_HOST is, construct it
+if not WEBHOOK_URL or WEBHOOK_URL.startswith("https://<"):
+    if WEBHOOK_HOST and not WEBHOOK_HOST.startswith("<"):
+        if not WEBHOOK_PATH:
+            WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
         if not WEBHOOK_PATH.startswith("/"):
             WEBHOOK_PATH = "/" + WEBHOOK_PATH
         WEBHOOK_URL = f"https://{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
 
+# Ensure WEBHOOK_PATH starts with / if set
 if WEBHOOK_PATH and not WEBHOOK_PATH.startswith("/"):
     WEBHOOK_PATH = "/" + WEBHOOK_PATH
 
@@ -59,15 +57,21 @@ application = Flask(__name__)
 def _health():
     return "OK", 200
 
-@application.post(WEBHOOK_PATH)
+# Webhook endpoint - use WEBHOOK_PATH if set, otherwise use default path
+webhook_route = WEBHOOK_PATH if WEBHOOK_PATH else f"/{TELEGRAM_BOT_TOKEN}"
+
+@application.post(webhook_route)
 def _webhook():
     # Validate Telegram secret header if configured
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if WEBHOOK_SECRET_TOKEN and secret != WEBHOOK_SECRET_TOKEN:
         abort(403)
     # Forward the update to pyTelegramBotAPI
-    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-    bot.process_new_updates([update])
+    try:
+        update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
+        bot.process_new_updates([update])
+    except Exception as e:
+        print(f"Error processing webhook update: {e}")
     return "OK", 200
 
 @application.get("/diag")
@@ -521,7 +525,9 @@ def cb_pay_yk(c: telebot.types.CallbackQuery):
     if username:
         yk_metadata["telegram_username"] = f"@{username}"
 
-    item_description = name[:128] if isinstance(name, str) else "Курс"
+    # Strip HTML from item description for receipt
+    item_description = strip_html(name)
+    item_description = item_description[:128] if item_description else "Курс"
     provider_data = {
         "description": yk_description,
         "metadata": yk_metadata,
@@ -538,10 +544,12 @@ def cb_pay_yk(c: telebot.types.CallbackQuery):
     }
     provider_data_json = json.dumps(provider_data, ensure_ascii=False)
 
+    # Strip HTML from invoice title
+    clean_title_name = strip_html(name) if name else "Курс"
     try:
         bot.send_invoice(
             user_id,
-            title=f"Курс: {name}",
+            title=f"Курс: {clean_title_name}",
             description=invoice_description,
             provider_token=PAYMENT_PROVIDER_TOKEN,
             currency=CURRENCY,
@@ -596,7 +604,9 @@ def cb_pay_rbk(c: telebot.types.CallbackQuery):
         bot.answer_callback_query(c.id, "Неверная цена курса.", show_alert=True)
         return
     
-    prices = [types.LabeledPrice(label=name, amount=rub_to_kopecks(price))]
+    # Strip HTML from payment label (payment systems don't support HTML in labels)
+    payment_label = strip_html(name) if name else "Курс"
+    prices = [types.LabeledPrice(label=payment_label, amount=rub_to_kopecks(price))]
 
     # Generate unique InvoiceId for Robokassa
     # Format: user_id + timestamp (ensures uniqueness)
@@ -628,10 +638,12 @@ def cb_pay_rbk(c: telebot.types.CallbackQuery):
         print(f"[Robokassa TEST MODE] InvoiceId: {invoice_id}, Amount: {price} RUB")
         print(f"[Robokassa TEST MODE] Provider data: {provider_data_json}")
 
+    # Strip HTML from invoice title
+    clean_title_name = strip_html(name) if name else "Курс"
     try:
         bot.send_invoice(
             user_id,
-            title=f"Курс: {name}",
+            title=f"Курс: {clean_title_name}",
             description=invoice_description,
             provider_token=ROBOKASSA_PROVIDER_TOKEN,
             currency=CURRENCY,
@@ -660,7 +672,8 @@ def handle_pre_checkout(q: telebot.types.PreCheckoutQuery):
         if len(parts) < 2:
             bot.answer_pre_checkout_query(q.id, ok=False, error_message="Неверный формат заказа.")
             return
-        uid, cid = parts[0], parts[1]
+        # Extract course_id (second part), user_id validation not needed here
+        cid = parts[1]
         courses = get_courses_data()
         course = next((x for x in courses if str(x.get("id")) == str(cid)), None)
         if course is None:
@@ -684,7 +697,8 @@ def handle_successful_payment(message: telebot.types.Message):
     if len(parts) < 2:
         bot.send_message(user_id, "Ошибка: неверный формат заказа. Обратитесь в поддержку.")
         return
-    _, course_id = parts[0], parts[1]
+    # Extract course_id (second part), ignore user_id (first part) and invoice_id (third part if present)
+    course_id = parts[1]
 
     try:
         courses = get_courses_data()
@@ -742,7 +756,9 @@ def handle_successful_payment(message: telebot.types.Message):
 
     # Placeholder for sending fiscal receipt (YooKassa auto-fiscalization recommended)
     try:
-        send_receipt_to_tax(user_id, course_name, amount, buyer_email)
+        # Strip HTML from course name for receipt
+        clean_receipt_name = strip_html(course_name) if course_name else f"ID {course_id}"
+        send_receipt_to_tax(user_id, clean_receipt_name, amount, buyer_email)
     except Exception as e:
         print("send_receipt_to_tax error:", e)
 
@@ -764,6 +780,7 @@ def handle_broadcast(message: telebot.types.Message):
 
     recipients = []
     try:
+        # Use separate connection for broadcast to avoid conflicts
         conn = sqlite3.connect(DATABASE_PATH)
         cur = conn.cursor()
         if cmd == "/broadcast_all":
@@ -776,17 +793,26 @@ def handle_broadcast(message: telebot.types.Message):
         recipients = [r[0] for r in rows]
         conn.close()
     except Exception as e:
-        bot.reply_to(message, f"Ошибка: {e}")
+        print(f"Broadcast database error: {e}")
+        bot.reply_to(message, f"Ошибка при получении списка получателей: {e}")
         return
 
     sent = 0
+    failed = 0
     for uid in recipients:
         try:
             bot.send_message(uid, text, disable_web_page_preview=True)
             sent += 1
-        except Exception:
-            pass
-    bot.reply_to(message, f"Отправлено {sent} пользователям.")
+        except Exception as e:
+            failed += 1
+            # Log first few failures for debugging
+            if failed <= 3:
+                print(f"Failed to send broadcast to user {uid}: {e}")
+    total = len(recipients)
+    reply_msg = f"Отправлено {sent} из {total} пользователям."
+    if failed > 0:
+        reply_msg += f" Не удалось отправить: {failed}."
+    bot.reply_to(message, reply_msg)
 
 
 def remove_user_from_channel(user_id: int, channel_id: str):
