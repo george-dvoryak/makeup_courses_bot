@@ -72,11 +72,21 @@ ADMIN_IDS = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
 # === Webhook (PythonAnywhere) ===
 USE_WEBHOOK = get_bool_env("USE_WEBHOOK", False)
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST", "")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "")
 WEBHOOK_SECRET_TOKEN = os.getenv("WEBHOOK_SECRET_TOKEN", "")
 # Construct WEBHOOK_URL if not explicitly set
 WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
+
+# Process WEBHOOK_PATH: get from env, construct if needed, ensure it starts with "/"
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "")
 if not WEBHOOK_URL and WEBHOOK_HOST and not WEBHOOK_HOST.startswith("<"):
+    # If WEBHOOK_URL is not set but WEBHOOK_HOST is, construct WEBHOOK_PATH if needed
     if not WEBHOOK_PATH:
         WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
+    # Ensure WEBHOOK_PATH starts with "/"
+    if WEBHOOK_PATH and not WEBHOOK_PATH.startswith("/"):
+        WEBHOOK_PATH = "/" + WEBHOOK_PATH
     WEBHOOK_URL = f"https://{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
+else:
+    # Even if WEBHOOK_URL is set or WEBHOOK_HOST is not set, ensure WEBHOOK_PATH starts with "/" if it exists
+    if WEBHOOK_PATH and not WEBHOOK_PATH.startswith("/"):
+        WEBHOOK_PATH = "/" + WEBHOOK_PATH

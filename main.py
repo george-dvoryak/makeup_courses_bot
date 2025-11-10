@@ -28,27 +28,18 @@ from google_sheets import get_courses_data, get_texts_data
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=False)
 
 # --- Webhook / WSGI (PythonAnywhere) support ---
-# Optional webhook-related config (can be provided via config.py or environment variables)
+# Import webhook config from config.py (already processed and normalized)
 try:
     from config import WEBHOOK_URL, WEBHOOK_PATH, WEBHOOK_SECRET_TOKEN, WEBHOOK_HOST
 except ImportError:
+    # Fallback to environment variables if config.py is not available
     WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
     WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "")
     WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN", "")
     WEBHOOK_HOST = os.environ.get("WEBHOOK_HOST", "")
-
-# If WEBHOOK_URL is not set but WEBHOOK_HOST is, construct it
-if not WEBHOOK_URL or WEBHOOK_URL.startswith("https://<"):
-    if WEBHOOK_HOST and not WEBHOOK_HOST.startswith("<"):
-        if not WEBHOOK_PATH:
-            WEBHOOK_PATH = f"/{TELEGRAM_BOT_TOKEN}"
-        if not WEBHOOK_PATH.startswith("/"):
-            WEBHOOK_PATH = "/" + WEBHOOK_PATH
-        WEBHOOK_URL = f"https://{WEBHOOK_HOST.rstrip('/')}{WEBHOOK_PATH}"
-
-# Ensure WEBHOOK_PATH starts with / if set
-if WEBHOOK_PATH and not WEBHOOK_PATH.startswith("/"):
-    WEBHOOK_PATH = "/" + WEBHOOK_PATH
+    # Normalize WEBHOOK_PATH (ensure it starts with "/")
+    if WEBHOOK_PATH and not WEBHOOK_PATH.startswith("/"):
+        WEBHOOK_PATH = "/" + WEBHOOK_PATH
 
 # Flask app to be used by the WSGI server on PythonAnywhere
 application = Flask(__name__)
