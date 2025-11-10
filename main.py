@@ -9,7 +9,7 @@ import time
 import re
 from flask import Flask, request, abort
 
-from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH
+from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID
 # Optional Robokassa settings (may be absent in config)
 try:
     from config import ENABLE_ROBOKASSA, ROBOKASSA_PROVIDER_TOKEN, RBK_TEST_MODE, RBK_SNO, RBK_TAX, RBK_PAYMENT_OBJECT, RBK_PAYMENT_METHOD
@@ -21,7 +21,7 @@ except ImportError:
     RBK_TAX = "none"  # self-employed: no VAT
     RBK_PAYMENT_OBJECT = "service"
     RBK_PAYMENT_METHOD = "full_payment"
-from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired
+from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions
 from google_sheets import get_courses_data, get_texts_data
 
 
@@ -183,7 +183,27 @@ PURCHASE_RECEIPT_MSG = texts.get("purchase_receipt_message", "Чек об опл
 SUBSCRIPTION_EXPIRED_MSG = texts.get("subscription_expired_message", "Ваш доступ к курсу {course_name} закончился.")
 
 
-# Main menu (Reply Keyboard)
+# Main menu keyboard generator (with admin buttons conditionally)
+def get_main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
+    """Generate main menu keyboard, adding admin buttons if user is admin"""
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    btn_catalog = types.KeyboardButton("Каталог")
+    btn_subs = types.KeyboardButton("Активные подписки")
+    btn_support = types.KeyboardButton("Поддержка")
+    btn_oferta = types.KeyboardButton("Оферта")
+    keyboard.add(btn_catalog)
+    keyboard.add(btn_subs, btn_support)
+    keyboard.add(btn_oferta)
+    
+    # Add admin buttons if user is admin
+    if user_id in ADMIN_IDS:
+        btn_admin_subs = types.KeyboardButton("📊 Все подписки")
+        btn_admin_sheets = types.KeyboardButton("📋 Google Sheets")
+        keyboard.add(btn_admin_subs, btn_admin_sheets)
+    
+    return keyboard
+
+# Legacy main menu keyboard for backward compatibility (used in some places)
 main_menu_keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
 btn_catalog = types.KeyboardButton("Каталог")
 btn_subs = types.KeyboardButton("Активные подписки")
@@ -199,14 +219,16 @@ def handle_start(message: telebot.types.Message):
     username = message.from_user.username or ""
     add_user(user_id, username)
 
+    # Use dynamic keyboard that includes admin buttons if user is admin
+    keyboard = get_main_menu_keyboard(user_id)
     welcome_image_url = texts.get("welcome_image_url")
     try:
         if welcome_image_url:
-            bot.send_photo(user_id, welcome_image_url, caption=WELCOME_MSG, reply_markup=main_menu_keyboard)
+            bot.send_photo(user_id, welcome_image_url, caption=WELCOME_MSG, reply_markup=keyboard)
         else:
-            bot.send_message(user_id, WELCOME_MSG, reply_markup=main_menu_keyboard)
+            bot.send_message(user_id, WELCOME_MSG, reply_markup=keyboard)
     except Exception:
-        bot.send_message(user_id, WELCOME_MSG, reply_markup=main_menu_keyboard)
+        bot.send_message(user_id, WELCOME_MSG, reply_markup=keyboard)
 
 def send_catalog_message(user_id, edit_message=None, edit_message_id=None, edit_chat_id=None):
     """Helper function to send/update catalog message"""
@@ -313,6 +335,91 @@ def handle_oferta(message: telebot.types.Message):
     except Exception:
         # Fallback: просто отправим ссылку, если по какой-то причине Telegram не скачал файл по URL
         bot.send_message(user_id, f"Договор оферты: {oferta_url}", disable_web_page_preview=False)
+
+# Admin handlers
+@bot.message_handler(func=lambda m: m.text == "📊 Все подписки")
+def handle_admin_all_subscriptions(message: telebot.types.Message):
+    """Admin handler: show all active subscriptions for all users"""
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.send_message(user_id, "У вас нет доступа к этой функции.")
+        return
+    
+    try:
+        all_subs = get_all_active_subscriptions()
+        all_subs = list(all_subs) if all_subs else []
+        
+        if not all_subs:
+            bot.send_message(user_id, "Нет активных подписок.")
+            return
+        
+        # Group by user for better readability
+        user_subs = {}
+        for s in all_subs:
+            uid = s["user_id"]
+            if uid not in user_subs:
+                user_subs[uid] = []
+            user_subs[uid].append(s)
+        
+        text = f"📊 Все активные подписки ({len(all_subs)} всего):\n\n"
+        
+        for uid, subs in sorted(user_subs.items()):
+            # Try to get username
+            user_info = get_user(uid)
+            username = user_info["username"] if user_info and user_info["username"] else f"ID {uid}"
+            text += f"👤 {username} (ID: {uid}):\n"
+            
+            for s in subs:
+                course_name = s["course_name"]
+                clean_course_name = strip_html(course_name) if course_name else "Курс"
+                expiry_ts = s["expiry"]
+                dt = datetime.datetime.fromtimestamp(expiry_ts)
+                dstr = dt.strftime("%Y-%m-%d %H:%M")
+                text += f"  • {clean_course_name} (до {dstr})\n"
+            text += "\n"
+        
+        # Split message if too long (Telegram limit is 4096 chars)
+        if len(text) > 4000:
+            parts = text.split("\n\n")
+            current_msg = ""
+            for part in parts:
+                if len(current_msg) + len(part) + 2 > 4000:
+                    bot.send_message(user_id, current_msg, disable_web_page_preview=True)
+                    current_msg = part + "\n\n"
+                else:
+                    current_msg += part + "\n\n"
+            if current_msg.strip():
+                bot.send_message(user_id, current_msg, disable_web_page_preview=True)
+        else:
+            bot.send_message(user_id, text, disable_web_page_preview=True)
+            
+    except Exception as e:
+        print(f"Error in handle_admin_all_subscriptions: {e}")
+        bot.send_message(user_id, f"Ошибка при получении подписок: {e}")
+
+@bot.message_handler(func=lambda m: m.text == "📋 Google Sheets")
+def handle_admin_google_sheets(message: telebot.types.Message):
+    """Admin handler: open Google Sheets link"""
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.send_message(user_id, "У вас нет доступа к этой функции.")
+        return
+    
+    if not GSHEET_ID:
+        bot.send_message(user_id, "Google Sheets ID не настроен.")
+        return
+    
+    sheets_url = f"https://docs.google.com/spreadsheets/d/{GSHEET_ID}/edit"
+    
+    # Create inline keyboard with URL button
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.add(types.InlineKeyboardButton("📋 Открыть Google Sheets", url=sheets_url))
+    
+    bot.send_message(
+        user_id,
+        "Нажмите на кнопку ниже, чтобы открыть Google Sheets:",
+        reply_markup=keyboard
+    )
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("course_"))
 def cb_course(c: telebot.types.CallbackQuery):

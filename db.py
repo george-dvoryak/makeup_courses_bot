@@ -122,3 +122,19 @@ def get_expired_subscriptions():
         (now,)
     )
     return cur.fetchall()
+
+def get_all_active_subscriptions():
+    """Get all active subscriptions for all users (admin function)"""
+    conn = get_connection()
+    cur = conn.cursor()
+    now = int(time.time())
+    cur.execute(
+        """
+        SELECT user_id, course_id, course_name, channel_id, expiry
+        FROM purchases
+        WHERE expiry > ?
+        ORDER BY expiry DESC;
+        """,
+        (now,)
+    )
+    return cur.fetchall()
