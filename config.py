@@ -26,6 +26,11 @@ if not PAYMENT_PROVIDER_TOKEN:
     raise ValueError("PAYMENT_PROVIDER_TOKEN is required. Please set it in .env file")
 CURRENCY = os.getenv("CURRENCY", "RUB")
 
+# === Offer details ===
+# Optional details to include in the offer message
+OFFER_INN = os.getenv("OFFER_INN", "771618630441")
+OFFER_FULL_NAME = os.getenv("OFFER_FULL_NAME", "Дворяк Георгий Алексеевич")
+
 # === PAYMENTS (Robokassa via Telegram Payments) ===
 # Feature flag to show Robokassa buttons/flows in the bot UI
 ENABLE_ROBOKASSA = get_bool_env("ENABLE_ROBOKASSA", False)

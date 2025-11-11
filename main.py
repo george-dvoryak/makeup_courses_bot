@@ -9,18 +9,7 @@ import time
 import re
 from flask import Flask, request, abort
 
-from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID
-# Optional Robokassa settings (may be absent in config)
-try:
-    from config import ENABLE_ROBOKASSA, ROBOKASSA_PROVIDER_TOKEN, RBK_TEST_MODE, RBK_SNO, RBK_TAX, RBK_PAYMENT_OBJECT, RBK_PAYMENT_METHOD
-except ImportError:
-    ENABLE_ROBOKASSA = False
-    ROBOKASSA_PROVIDER_TOKEN = None
-    RBK_TEST_MODE = True
-    RBK_SNO = "usn_income"
-    RBK_TAX = "none"  # self-employed: no VAT
-    RBK_PAYMENT_OBJECT = "service"
-    RBK_PAYMENT_METHOD = "full_payment"
+from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, OFFER_INN, OFFER_FULL_NAME
 from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions
 from google_sheets import get_courses_data, get_texts_data
 
@@ -112,59 +101,7 @@ def clean_html_text(text: str) -> str:
     text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
     return text.strip()
 
-# Build Robokassa provider_data helper
-def build_robokassa_provider_data(item_name: str, total_rub: float, invoice_id: int) -> str:
-    """
-    Build provider_data for Robokassa Telegram Payments provider.
-    
-    According to Robokassa documentation:
-    - InvoiceId: unique merchant order number (string or number)
-    - Receipt: fiscal receipt data with taxation info
-    
-    Args:
-        item_name: Product/service name (max 128 chars)
-        total_rub: Total amount in rubles
-        invoice_id: Unique invoice ID (merchant order number)
-    
-    Returns:
-        JSON string with InvoiceId and Receipt structure
-    """
-    # Validate and sanitize item name - strip HTML tags for receipt
-    if not item_name or not isinstance(item_name, str):
-        item_name = "Услуга"
-    # Remove HTML tags from item name for receipt
-    item_name = strip_html(item_name)
-    item_name = item_name[:128].strip()
-    if not item_name:
-        item_name = "Услуга"
-    
-    # Validate amount
-    total_rub = float(total_rub)
-    if total_rub <= 0:
-        raise ValueError("Amount must be positive")
-    
-    # Build receipt structure according to Robokassa requirements
-    receipt = {
-        "sno": RBK_SNO,  # Tax system: osn, usn_income, usn_income_outcome, envd, esn, patent
-        "items": [
-            {
-                "name": item_name,
-                "quantity": 1.0,  # Must be float
-                "sum": float(rub_str(total_rub)),  # Total for this item (with 2 decimal places)
-                "tax": RBK_TAX,  # Tax rate: none, vat0, vat10, vat20, vat110, vat120
-                "payment_method": RBK_PAYMENT_METHOD,  # full_payment, full_prepayment, etc.
-                "payment_object": RBK_PAYMENT_OBJECT  # service, commodity, etc.
-            }
-        ]
-    }
-    
-    # InvoiceId can be string or number - using string for better compatibility
-    data = {
-        "InvoiceId": str(invoice_id),  # Merchant order number (unique)
-        "Receipt": receipt
-    }
-    
-    return json.dumps(data, ensure_ascii=False)
+# (Robokassa helper removed)
 
 # Load customizable texts
 texts = {}
@@ -331,10 +268,12 @@ def handle_oferta(message: telebot.types.Message):
     user_id = message.from_user.id
     oferta_url = "https://github.com/george-dvoryak/cdn/blob/main/oferta.pdf?raw=true"
     try:
-        bot.send_document(user_id, oferta_url, caption="Договор оферты (PDF)")
+        caption = f"Договор оферты (PDF)\nИНН: {OFFER_INN}\nФИО: {OFFER_FULL_NAME}"
+        bot.send_document(user_id, oferta_url, caption=caption)
     except Exception:
         # Fallback: просто отправим ссылку, если по какой-то причине Telegram не скачал файл по URL
-        bot.send_message(user_id, f"Договор оферты: {oferta_url}", disable_web_page_preview=False)
+        text = f"Договор оферты: {oferta_url}\n\nИНН: {OFFER_INN}\nФИО: {OFFER_FULL_NAME}"
+        bot.send_message(user_id, text, disable_web_page_preview=False)
 
 # Admin handlers
 @bot.message_handler(func=lambda m: m.text == "📊 Все подписки")
@@ -477,13 +416,7 @@ def cb_course(c: telebot.types.CallbackQuery):
     clean_desc = strip_html(desc) if desc else ""
     text = f"{formatted_name}\n{clean_desc}\n\nЦена: {price} руб.\nДоступ: {duration} дн."
     ikb = types.InlineKeyboardMarkup()
-    if ENABLE_ROBOKASSA and ROBOKASSA_PROVIDER_TOKEN:
-        ikb.row(
-            types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"),
-            types.InlineKeyboardButton("Купить (Robokassa)", callback_data=f"pay_rbk_{course_id}")
-        )
-    else:
-        ikb.add(types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"))
+    ikb.add(types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"))
     ikb.add(types.InlineKeyboardButton("⬅️ Назад к каталогу", callback_data="back_to_catalog"))
     
     # Try to edit existing message first, then fallback to sending new message
@@ -568,13 +501,7 @@ def cb_buy(c: telebot.types.CallbackQuery):
     clean_name = strip_html(name) if name else "Курс"
     text = f"{clean_name}\nВыберите способ оплаты:"
     kb = types.InlineKeyboardMarkup()
-    if ENABLE_ROBOKASSA and ROBOKASSA_PROVIDER_TOKEN:
-        kb.row(
-            types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"),
-            types.InlineKeyboardButton("Robokassa", callback_data=f"pay_rbk_{course_id}")
-        )
-    else:
-        kb.add(types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"))
+    kb.add(types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"))
     try:
         bot.send_message(user_id, text, reply_markup=kb)
         bot.answer_callback_query(c.id)
@@ -663,102 +590,7 @@ def cb_pay_yk(c: telebot.types.CallbackQuery):
         print("send_invoice (YK) error:", e)
         bot.answer_callback_query(c.id, "Ошибка при выставлении счета (ЮKassa).", show_alert=True)
 
-# Handler for Robokassa payments
-@bot.callback_query_handler(func=lambda c: c.data.startswith("pay_rbk_"))
-def cb_pay_rbk(c: telebot.types.CallbackQuery):
-    user_id = c.from_user.id
-    course_id = c.data.split("_", 2)[2]
-    
-    # Validate Robokassa configuration
-    if not ROBOKASSA_PROVIDER_TOKEN:
-        bot.answer_callback_query(c.id, "Robokassa не настроена. Обратитесь к администратору.", show_alert=True)
-        return
-    
-    # Log test mode status
-    if RBK_TEST_MODE:
-        print(f"[Robokassa TEST MODE] Payment request from user {user_id} for course {course_id}")
-    
-    try:
-        courses = get_courses_data()
-    except Exception as e:
-        print(f"Error fetching courses for Robokassa payment: {e}")
-        bot.answer_callback_query(c.id, "Не удалось получить данные курса.", show_alert=True)
-        return
-    
-    course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
-    if not course:
-        bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
-        return
-    
-    if has_active_subscription(user_id, str(course_id)):
-        bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
-        return
-
-    name = course.get("name", "Курс")
-    price = float(course.get("price", 0))
-    
-    # Validate price
-    if price <= 0:
-        bot.answer_callback_query(c.id, "Неверная цена курса.", show_alert=True)
-        return
-    
-    # Strip HTML from payment label (payment systems don't support HTML in labels)
-    payment_label = strip_html(name) if name else "Курс"
-    prices = [types.LabeledPrice(label=payment_label, amount=rub_to_kopecks(price))]
-
-    # Generate unique InvoiceId for Robokassa
-    # Format: user_id + timestamp (ensures uniqueness)
-    now_ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
-    invoice_id = int(f"{user_id}{now_ts}")  # Unique merchant order number
-    payload = f"{user_id}:{course_id}:{invoice_id}"
-
-    username = getattr(c.from_user, "username", None)
-    desc_suffix = f" (tg:@{username})" if username else ""
-    # Strip HTML from name for invoice description
-    clean_name = strip_html(name)
-    invoice_description = f'Оплата доступа к курсу "{clean_name}"{desc_suffix}'
-    invoice_description = invoice_description[:255]
-
-    # Build provider_data for Robokassa (InvoiceId + Receipt)
-    try:
-        provider_data_json = build_robokassa_provider_data(name, price, invoice_id)
-    except ValueError as e:
-        print(f"Error building Robokassa provider_data: {e}")
-        bot.answer_callback_query(c.id, "Ошибка при формировании чека.", show_alert=True)
-        return
-    except Exception as e:
-        print(f"Unexpected error building Robokassa provider_data: {e}")
-        bot.answer_callback_query(c.id, "Ошибка при подготовке платежа.", show_alert=True)
-        return
-
-    # Log provider_data in test mode for debugging
-    if RBK_TEST_MODE:
-        print(f"[Robokassa TEST MODE] InvoiceId: {invoice_id}, Amount: {price} RUB")
-        print(f"[Robokassa TEST MODE] Provider data: {provider_data_json}")
-
-    # Strip HTML from invoice title
-    clean_title_name = strip_html(name) if name else "Курс"
-    try:
-        bot.send_invoice(
-            user_id,
-            title=f"Курс: {clean_title_name}",
-            description=invoice_description,
-            provider_token=ROBOKASSA_PROVIDER_TOKEN,
-            currency=CURRENCY,
-            prices=prices,
-            start_parameter="purchase-course-rbk",
-            invoice_payload=payload,
-            need_email=True,
-            send_email_to_provider=True,
-            provider_data=provider_data_json
-        )
-        bot.answer_callback_query(c.id)
-    except Exception as e:
-        error_msg = str(e)
-        print(f"send_invoice (Robokassa) error: {error_msg}")
-        if RBK_TEST_MODE:
-            print(f"[Robokassa TEST MODE] Full error details: {repr(e)}")
-        bot.answer_callback_query(c.id, "Ошибка при выставлении счета (Robokassa).", show_alert=True)
+# (Robokassa handler removed)
 
 @bot.pre_checkout_query_handler(func=lambda q: True)
 def handle_pre_checkout(q: telebot.types.PreCheckoutQuery):

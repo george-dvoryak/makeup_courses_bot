@@ -62,7 +62,8 @@ cp .env.example .env
 - `GOOGLE_SHEETS_USE_API` — `True` для gspread, иначе CSV.
 - `GOOGLE_CREDENTIALS_FILE` — JSON сервисного аккаунта (если используете gspread).
 - `USE_WEBHOOK`, `WEBHOOK_HOST`, `WEBHOOK_PATH` — для PythonAnywhere вебхука.
-- `ENABLE_ROBOKASSA`, `ROBOKASSA_PROVIDER_TOKEN` — для Robokassa платежей.
+- `OFFER_INN` — ИНН для подписи оферты (по умолчанию 771618630441).
+- `OFFER_FULL_NAME` — ФИО для подписи оферты (по умолчанию "Дворяк Георгий Алексеевич").
 
 ## Права бота в каналах
 Бот должен быть администратором каждого канала-курса с правами:
