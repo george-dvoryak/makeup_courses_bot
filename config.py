@@ -33,7 +33,7 @@ OFFER_FULL_NAME = os.getenv("OFFER_FULL_NAME", "Дворяк Георгий Ал
 
 # === PAYMENTS (Robokassa via Telegram Payments) ===
 # Feature flag to show Robokassa buttons/flows in the bot UI
-ENABLE_ROBOKASSA = get_bool_env("ENABLE_ROBOKASSA", False)
+ENABLE_ROBOKASSA = get_bool_env("ENABLE_ROBOKASSA", True)
 # BotFather provider token for Robokassa
 # For TEST environment: Get test token from BotFather after connecting Robokassa test shop
 # For PRODUCTION: Get production token from BotFather after connecting Robokassa production shop
@@ -51,6 +51,18 @@ RBK_SNO = os.getenv("RBK_SNO", "usn_income")
 RBK_TAX = os.getenv("RBK_TAX", "none")
 RBK_PAYMENT_OBJECT = os.getenv("RBK_PAYMENT_OBJECT", "service")
 RBK_PAYMENT_METHOD = os.getenv("RBK_PAYMENT_METHOD", "full_payment")
+# Robokassa shop credentials (for webhook verification if needed)
+# Shop ID (MerchantLogin) from Robokassa dashboard
+RBK_SHOP_ID = os.getenv("RBK_SHOP_ID", "makeupgeorgy")
+# Password #1 (for generating payment signatures) - Production
+RBK_PASSWORD1 = os.getenv("RBK_PASSWORD1", "")
+# Password #2 (for verifying webhook signatures) - Production
+RBK_PASSWORD2 = os.getenv("RBK_PASSWORD2", "")
+# Test passwords (for test environment)
+RBK_TEST_PASSWORD1 = os.getenv("RBK_TEST_PASSWORD1", "")
+RBK_TEST_PASSWORD2 = os.getenv("RBK_TEST_PASSWORD2", "")
+# Hash algorithm (MD5, SHA1, SHA256, SHA512)
+RBK_HASH_ALGORITHM = os.getenv("RBK_HASH_ALGORITHM", "MD5")
 
 # === SQLite DB ===
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")

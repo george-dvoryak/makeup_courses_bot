@@ -7,9 +7,11 @@ from telebot import types
 import os
 import time
 import re
+import hashlib
+from urllib.parse import urlencode
 from flask import Flask, request, abort
 
-from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, OFFER_INN, OFFER_FULL_NAME
+from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, OFFER_INN, OFFER_FULL_NAME, ENABLE_ROBOKASSA, RBK_SHOP_ID, RBK_PASSWORD1, RBK_PASSWORD2, RBK_TEST_PASSWORD1, RBK_TEST_PASSWORD2, RBK_TEST_MODE, RBK_HASH_ALGORITHM, RBK_SNO, RBK_TAX, RBK_PAYMENT_OBJECT, RBK_PAYMENT_METHOD
 from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions
 from google_sheets import get_courses_data, get_texts_data
 
@@ -63,6 +65,180 @@ def _diag():
         report = f"diag error: {e}"
     return report, 200
 
+# Robokassa webhook handlers (Result/Success/Fail URLs)
+# Note: These URLs should be HTTPS endpoints, not Telegram bot URLs
+# Configure proper HTTPS URLs in Robokassa dashboard for production use
+
+@application.route("/robokassa/result", methods=["GET", "POST"])
+def robokassa_result():
+    """
+    Handle Robokassa Result URL notification (payment status update)
+    This endpoint receives payment notifications from Robokassa
+    Must return "OK" if payment is valid, or error code otherwise
+    """
+    try:
+        # Get request data (can be GET or POST)
+        if request.method == "GET":
+            data = request.args.to_dict()
+        else:
+            data = request.form.to_dict() if request.form else request.get_json() or {}
+        
+        # Log the notification for debugging
+        print(f"[Robokassa Result] Received notification: {data}")
+        
+        # Extract required parameters
+        out_sum = data.get("OutSum", "")
+        invoice_id = data.get("InvId", "")  # Note: Robokassa sends InvId, not InvoiceID
+        signature_value = data.get("SignatureValue", "")
+        
+        if not out_sum or not invoice_id or not signature_value:
+            print(f"[Robokassa Result] Missing required parameters")
+            return "ERROR: Missing parameters", 400
+        
+        # Get password #2 for verification
+        password = RBK_TEST_PASSWORD2 if RBK_TEST_MODE else RBK_PASSWORD2
+        if not password:
+            print(f"[Robokassa Result] Password #2 not configured")
+            return "ERROR: Configuration error", 500
+        
+        # Verify signature
+        is_valid = verify_robokassa_signature(
+            out_sum=out_sum,
+            invoice_id=invoice_id,
+            signature_value=signature_value,
+            password=password,
+            algorithm=RBK_HASH_ALGORITHM
+        )
+        
+        if not is_valid:
+            print(f"[Robokassa Result] Invalid signature for invoice {invoice_id}")
+            return "ERROR: Invalid signature", 400
+        
+        # Find pending payment in database
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            cur.execute("SELECT user_id, course_id, amount FROM pending_payments WHERE invoice_id = ?", (invoice_id,))
+            row = cur.fetchone()
+            
+            if not row:
+                print(f"[Robokassa Result] Payment not found for invoice {invoice_id}")
+                conn.close()
+                return "ERROR: Payment not found", 404
+            
+            user_id, course_id, expected_amount = row[0], row[1], row[2]
+            
+            # Verify amount matches
+            if abs(float(out_sum) - float(expected_amount)) > 0.01:  # Allow small floating point differences
+                print(f"[Robokassa Result] Amount mismatch for invoice {invoice_id}: expected {expected_amount}, got {out_sum}")
+                conn.close()
+                return "ERROR: Amount mismatch", 400
+            
+            # Get course data
+            try:
+                courses = get_courses_data()
+                course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
+                if not course:
+                    print(f"[Robokassa Result] Course {course_id} not found")
+                    conn.close()
+                    return "ERROR: Course not found", 404
+                
+                course_name = course.get("name", f"ID {course_id}")
+                duration = int(course.get("duration_days", 0))
+                channel = str(course.get("channel", ""))
+                
+                # Add purchase to database
+                expiry_ts = add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"rbk_{invoice_id}")
+                
+                # Remove from pending payments
+                cur.execute("DELETE FROM pending_payments WHERE invoice_id = ?", (invoice_id,))
+                conn.commit()
+                conn.close()
+                
+                # Send success message to user
+                clean_course_name = strip_html(course_name) if course_name else f"ID {course_id}"
+                text = f"✅ Оплата успешно получена!\n\n"
+                text += f"Вам предоставлен доступ к курсу: {clean_course_name}"
+                
+                # Create invite link if channel exists
+                invite_link = None
+                if channel:
+                    try:
+                        invite = bot.create_chat_invite_link(chat_id=channel, member_limit=1, expire_date=None)
+                        invite_link = invite.invite_link
+                    except Exception as e:
+                        print(f"create_chat_invite_link failed for {channel}: {e}")
+                
+                if invite_link:
+                    text += "\n\nНажмите кнопку ниже, чтобы перейти к материалам курса."
+                    kb = types.InlineKeyboardMarkup()
+                    kb.add(types.InlineKeyboardButton("Перейти в канал курса", url=invite_link))
+                    bot.send_message(user_id, text, reply_markup=kb)
+                else:
+                    bot.send_message(user_id, text)
+                
+                # Notify admins
+                admin_text = f"💰 Оплата Robokassa: пользователь {user_id} купил {clean_course_name} на сумму {out_sum} руб. (InvoiceID: {invoice_id})"
+                for aid in ADMIN_IDS:
+                    try:
+                        bot.send_message(aid, admin_text)
+                    except Exception:
+                        pass
+                
+                print(f"[Robokassa Result] Successfully processed payment for invoice {invoice_id}")
+                return "OK", 200
+                
+            except Exception as e:
+                print(f"[Robokassa Result] Error processing payment: {e}")
+                conn.close()
+                return "ERROR: Processing error", 500
+                
+        except Exception as e:
+            print(f"[Robokassa Result] Database error: {e}")
+            return "ERROR: Database error", 500
+        
+    except Exception as e:
+        print(f"[Robokassa Result] Error: {e}")
+        return "ERROR", 500
+
+@application.route("/robokassa/success", methods=["GET", "POST"])
+def robokassa_success():
+    """
+    Handle Robokassa Success URL (user redirected after successful payment)
+    """
+    try:
+        if request.method == "GET":
+            data = request.args.to_dict()
+        else:
+            data = request.form.to_dict() if request.form else request.get_json() or {}
+        
+        print(f"[Robokassa Success] User redirected: {data}")
+        
+        # Return a simple success page or redirect
+        return "Payment successful! You can close this page.", 200
+    except Exception as e:
+        print(f"[Robokassa Success] Error: {e}")
+        return "ERROR", 500
+
+@application.route("/robokassa/fail", methods=["GET", "POST"])
+def robokassa_fail():
+    """
+    Handle Robokassa Fail URL (user redirected after failed payment)
+    """
+    try:
+        if request.method == "GET":
+            data = request.args.to_dict()
+        else:
+            data = request.form.to_dict() if request.form else request.get_json() or {}
+        
+        print(f"[Robokassa Fail] User redirected: {data}")
+        
+        # Return a simple failure page or redirect
+        return "Payment failed. Please try again.", 200
+    except Exception as e:
+        print(f"[Robokassa Fail] Error: {e}")
+        return "ERROR", 500
+
 # Configure Telegram webhook at import time when running under WSGI
 if USE_WEBHOOK and WEBHOOK_URL and not WEBHOOK_URL.startswith("https://<"):
     try:
@@ -101,7 +277,99 @@ def clean_html_text(text: str) -> str:
     text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
     return text.strip()
 
-# (Robokassa helper removed)
+# Robokassa direct payment integration
+def generate_robokassa_signature(merchant_login: str, out_sum: str, invoice_id: str, password: str, algorithm: str = "MD5") -> str:
+    """
+    Generate Robokassa payment signature.
+    Format: MerchantLogin:OutSum:InvoiceID:Password#1
+    """
+    signature_string = f"{merchant_login}:{out_sum}:{invoice_id}:{password}"
+    
+    if algorithm.upper() == "MD5":
+        return hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+    elif algorithm.upper() == "SHA1":
+        return hashlib.sha1(signature_string.encode('utf-8')).hexdigest()
+    elif algorithm.upper() == "SHA256":
+        return hashlib.sha256(signature_string.encode('utf-8')).hexdigest()
+    elif algorithm.upper() == "SHA512":
+        return hashlib.sha512(signature_string.encode('utf-8')).hexdigest()
+    else:
+        # Default to MD5
+        return hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+
+def verify_robokassa_signature(out_sum: str, invoice_id: str, signature_value: str, password: str, algorithm: str = "MD5") -> bool:
+    """
+    Verify Robokassa payment signature from Result URL.
+    Format: OutSum:InvoiceID:Password#2
+    """
+    signature_string = f"{out_sum}:{invoice_id}:{password}"
+    
+    if algorithm.upper() == "MD5":
+        calculated = hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+    elif algorithm.upper() == "SHA1":
+        calculated = hashlib.sha1(signature_string.encode('utf-8')).hexdigest()
+    elif algorithm.upper() == "SHA256":
+        calculated = hashlib.sha256(signature_string.encode('utf-8')).hexdigest()
+    elif algorithm.upper() == "SHA512":
+        calculated = hashlib.sha512(signature_string.encode('utf-8')).hexdigest()
+    else:
+        calculated = hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+    
+    return calculated.lower() == signature_value.lower()
+
+def generate_robokassa_payment_url(merchant_login: str, out_sum: float, invoice_id: str, password: str, algorithm: str = "MD5", description: str = "", is_test: bool = False) -> str:
+    """
+    Generate Robokassa payment URL.
+    
+    Args:
+        merchant_login: Shop ID (MerchantLogin)
+        out_sum: Payment amount in rubles
+        invoice_id: Unique invoice ID
+        password: Password #1
+        algorithm: Hash algorithm (MD5, SHA1, SHA256, SHA512)
+        description: Payment description (optional)
+        is_test: Use test environment
+    
+    Returns:
+        Payment URL string
+    """
+    out_sum_str = f"{out_sum:.2f}"
+    signature = generate_robokassa_signature(merchant_login, out_sum_str, invoice_id, password, algorithm)
+    
+    params = {
+        "MerchantLogin": merchant_login,
+        "OutSum": out_sum_str,
+        "InvoiceID": invoice_id,
+        "SignatureValue": signature
+    }
+    
+    if description:
+        params["Description"] = description[:100]  # Max 100 chars
+    
+    # Add receipt data for fiscalization (JSON in Receipt parameter)
+    receipt_data = {
+        "sno": RBK_SNO,
+        "items": [
+            {
+                "name": description[:128] if description else "Услуга",
+                "quantity": 1.0,
+                "sum": float(out_sum_str),
+                "tax": RBK_TAX,
+                "payment_method": RBK_PAYMENT_METHOD,
+                "payment_object": RBK_PAYMENT_OBJECT
+            }
+        ]
+    }
+    params["Receipt"] = json.dumps(receipt_data, ensure_ascii=False)
+    
+    query_string = urlencode(params)
+    
+    if is_test:
+        base_url = "https://auth.robokassa.ru/Merchant/Index.aspx"
+    else:
+        base_url = "https://auth.robokassa.ru/Merchant/Index.aspx"
+    
+    return f"{base_url}?{query_string}"
 
 # Load customizable texts
 texts = {}
@@ -418,7 +686,14 @@ def cb_course(c: telebot.types.CallbackQuery):
     clean_desc = strip_html(desc) if desc else ""
     text = f"{formatted_name}\n{clean_desc}\n\nЦена: {price} руб.\nДоступ: {duration} дн."
     ikb = types.InlineKeyboardMarkup()
-    ikb.add(types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"))
+    password = RBK_TEST_PASSWORD1 if RBK_TEST_MODE else RBK_PASSWORD1
+    if ENABLE_ROBOKASSA and RBK_SHOP_ID and password:
+        ikb.row(
+            types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"),
+            types.InlineKeyboardButton("Купить (Robokassa)", callback_data=f"pay_rbk_{course_id}")
+        )
+    else:
+        ikb.add(types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"))
     ikb.add(types.InlineKeyboardButton("⬅️ Назад к каталогу", callback_data="back_to_catalog"))
     
     # Try to edit existing message first, then fallback to sending new message
@@ -503,7 +778,14 @@ def cb_buy(c: telebot.types.CallbackQuery):
     clean_name = strip_html(name) if name else "Курс"
     text = f"{clean_name}\nВыберите способ оплаты:"
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"))
+    password = RBK_TEST_PASSWORD1 if RBK_TEST_MODE else RBK_PASSWORD1
+    if ENABLE_ROBOKASSA and RBK_SHOP_ID and password:
+        kb.row(
+            types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"),
+            types.InlineKeyboardButton("Robokassa", callback_data=f"pay_rbk_{course_id}")
+        )
+    else:
+        kb.add(types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"))
     try:
         bot.send_message(user_id, text, reply_markup=kb)
         bot.answer_callback_query(c.id)
@@ -592,7 +874,114 @@ def cb_pay_yk(c: telebot.types.CallbackQuery):
         print("send_invoice (YK) error:", e)
         bot.answer_callback_query(c.id, "Ошибка при выставлении счета (ЮKassa).", show_alert=True)
 
-# (Robokassa handler removed)
+# Handler for Robokassa direct payments (via payment link)
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pay_rbk_"))
+def cb_pay_rbk(c: telebot.types.CallbackQuery):
+    user_id = c.from_user.id
+    course_id = c.data.split("_", 2)[2]
+    
+    # Validate Robokassa configuration
+    password = RBK_TEST_PASSWORD1 if RBK_TEST_MODE else RBK_PASSWORD1
+    if not RBK_SHOP_ID or not password:
+        bot.answer_callback_query(c.id, "Robokassa не настроена. Обратитесь к администратору.", show_alert=True)
+        return
+    
+    # Log test mode status
+    if RBK_TEST_MODE:
+        print(f"[Robokassa TEST MODE] Payment request from user {user_id} for course {course_id}")
+    
+    try:
+        courses = get_courses_data()
+    except Exception as e:
+        print(f"Error fetching courses for Robokassa payment: {e}")
+        bot.answer_callback_query(c.id, "Не удалось получить данные курса.", show_alert=True)
+        return
+    
+    course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
+    if not course:
+        bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
+        return
+    
+    if has_active_subscription(user_id, str(course_id)):
+        bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
+        return
+
+    name = course.get("name", "Курс")
+    price = float(course.get("price", 0))
+    
+    # Validate price
+    if price <= 0:
+        bot.answer_callback_query(c.id, "Неверная цена курса.", show_alert=True)
+        return
+
+    # Generate unique InvoiceId for Robokassa
+    # Format: user_id + timestamp (ensures uniqueness)
+    now_ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    invoice_id = f"{user_id}_{course_id}_{now_ts}"
+
+    # Clean course name for description
+    clean_name = strip_html(name)
+    description = f"Оплата доступа к курсу: {clean_name}"
+    
+    # Generate payment URL
+    try:
+        payment_url = generate_robokassa_payment_url(
+            merchant_login=RBK_SHOP_ID,
+            out_sum=price,
+            invoice_id=invoice_id,
+            password=password,
+            algorithm=RBK_HASH_ALGORITHM,
+            description=description,
+            is_test=RBK_TEST_MODE
+        )
+        
+        # Store payment info in database for later verification
+        # We'll use a simple approach: store invoice_id -> (user_id, course_id) mapping
+        # In production, you might want a proper pending_payments table
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            # Create pending_payments table if not exists
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_payments (
+                    invoice_id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    course_id TEXT,
+                    amount REAL,
+                    created_at INTEGER
+                )
+            """)
+            cur.execute(
+                "INSERT INTO pending_payments (invoice_id, user_id, course_id, amount, created_at) VALUES (?, ?, ?, ?, ?)",
+                (invoice_id, user_id, course_id, price, int(time.time()))
+            )
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"Error storing pending payment: {e}")
+        
+        # Send payment link to user
+        clean_title_name = strip_html(name) if name else "Курс"
+        text = f"💳 Оплата курса: {clean_title_name}\n\n"
+        text += f"Сумма: {price:.2f} руб.\n\n"
+        text += "Нажмите на кнопку ниже, чтобы перейти к оплате:"
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("💳 Оплатить через Robokassa", url=payment_url))
+        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"course_{course_id}"))
+        
+        bot.send_message(user_id, text, reply_markup=kb)
+        bot.answer_callback_query(c.id)
+        
+        if RBK_TEST_MODE:
+            print(f"[Robokassa TEST MODE] Generated payment URL for invoice {invoice_id}: {payment_url}")
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Error generating Robokassa payment URL: {error_msg}")
+        if RBK_TEST_MODE:
+            print(f"[Robokassa TEST MODE] Full error details: {repr(e)}")
+        bot.answer_callback_query(c.id, "Ошибка при создании ссылки на оплату.", show_alert=True)
 
 @bot.pre_checkout_query_handler(func=lambda q: True)
 def handle_pre_checkout(q: telebot.types.PreCheckoutQuery):
