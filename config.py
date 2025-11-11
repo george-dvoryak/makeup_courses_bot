@@ -26,27 +26,6 @@ if not PAYMENT_PROVIDER_TOKEN:
     raise ValueError("PAYMENT_PROVIDER_TOKEN is required. Please set it in .env file")
 CURRENCY = os.getenv("CURRENCY", "RUB")
 
-# === PAYMENTS (Robokassa via Telegram Payments) ===
-# Feature flag to show Robokassa buttons/flows in the bot UI
-ENABLE_ROBOKASSA = get_bool_env("ENABLE_ROBOKASSA", False)
-# BotFather provider token for Robokassa
-# For TEST environment: Get test token from BotFather after connecting Robokassa test shop
-# For PRODUCTION: Get production token from BotFather after connecting Robokassa production shop
-# Format: "MerchantLogin:TEST:Password" (test) or "MerchantLogin:LIVE:Password" (production)
-ROBOKASSA_PROVIDER_TOKEN = os.getenv("ROBOKASSA_PROVIDER_TOKEN", "")
-# Test mode flag (use test environment for development/testing)
-# Set to "True" to use test environment, "False" for production
-RBK_TEST_MODE = get_bool_env("RBK_TEST_MODE", True)
-# Receipt defaults tuned for self-employed (НПД). Adjust if ваш кейс требует иного:
-#   sno: one of ["osn","usn_income","usn_income_outcome","envd","esn","patent"]
-#   tax: 'none' for НПД (без НДС), or 'vat0', 'vat10', 'vat20', 'vat110', 'vat120'
-#   payment_object: typically 'service' for онлайн-курсов
-#   payment_method: usually 'full_payment'
-RBK_SNO = os.getenv("RBK_SNO", "usn_income")
-RBK_TAX = os.getenv("RBK_TAX", "none")
-RBK_PAYMENT_OBJECT = os.getenv("RBK_PAYMENT_OBJECT", "service")
-RBK_PAYMENT_METHOD = os.getenv("RBK_PAYMENT_METHOD", "full_payment")
-
 # === SQLite DB ===
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")
 

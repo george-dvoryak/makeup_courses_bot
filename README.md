@@ -62,7 +62,6 @@ cp .env.example .env
 - `GOOGLE_SHEETS_USE_API` — `True` для gspread, иначе CSV.
 - `GOOGLE_CREDENTIALS_FILE` — JSON сервисного аккаунта (если используете gspread).
 - `USE_WEBHOOK`, `WEBHOOK_HOST`, `WEBHOOK_PATH` — для PythonAnywhere вебхука.
-- `ENABLE_ROBOKASSA`, `ROBOKASSA_PROVIDER_TOKEN` — для Robokassa платежей.
 
 ## Права бота в каналах
 Бот должен быть администратором каждого канала-курса с правами:
@@ -97,42 +96,6 @@ cp .env.example .env
 - Подключите YooKassa к боту (BotFather → Payments → YooKassa).
 - Включите автоотправку чеков для самозанятого (в кабинете YooKassa/Мой Налог).
 - В `main.py` функция `send_receipt_to_tax` — заглушка для кастомной интеграции.
-
-## Robokassa (Telegram Payments)
-### Настройка тестовой среды
-1. Зарегистрируйтесь в [Robokassa](https://www.robokassa.ru/) и создайте тестовый магазин.
-2. В личном кабинете Robokassa настройте магазин для Telegram Payments.
-3. В BotFather подключите Robokassa как провайдера платежей:
-   - BotFather → ваш бот → Payments → Add Provider → Robokassa
-   - Введите данные магазина (MerchantLogin, пароли)
-   - Получите provider token (формат: `MerchantLogin:TEST:Password` для теста)
-4. В `config.py` установите:
-   ```python
-   ENABLE_ROBOKASSA = True
-   ROBOKASSA_PROVIDER_TOKEN = "ваш_тестовый_токен_от_BotFather"
-   RBK_TEST_MODE = True  # Для тестовой среды
-   ```
-5. Настройте параметры чека (для самозанятого/НПД):
-   - `RBK_SNO = "usn_income"` (система налогообложения)
-   - `RBK_TAX = "none"` (без НДС для НПД)
-   - `RBK_PAYMENT_OBJECT = "service"` (тип товара/услуги)
-   - `RBK_PAYMENT_METHOD = "full_payment"` (способ расчета)
-
-### Переход в production
-1. Создайте production магазин в Robokassa.
-2. Получите production provider token от BotFather (формат: `MerchantLogin:LIVE:Password`).
-3. В `config.py` установите:
-   ```python
-   ROBOKASSA_PROVIDER_TOKEN = "ваш_продакшн_токен"
-   RBK_TEST_MODE = False  # Для production
-   ```
-
-### Формат provider_data
-Бот автоматически формирует `provider_data` с:
-- `InvoiceId`: уникальный номер заказа (user_id + timestamp)
-- `Receipt`: фискальный чек с параметрами налогообложения
-
-Подробная документация: https://docs.robokassa.ru/
 
 ## Команды админа
 - `/broadcast_all <текст>`
