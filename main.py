@@ -136,7 +136,9 @@ def get_main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     if user_id in ADMIN_IDS:
         btn_admin_subs = types.KeyboardButton("📊 Все подписки")
         btn_admin_sheets = types.KeyboardButton("📋 Google Sheets")
+        btn_admin_broadcast = types.KeyboardButton("📣 Отправить рассылку")
         keyboard.add(btn_admin_subs, btn_admin_sheets)
+        keyboard.add(btn_admin_broadcast)
     
     return keyboard
 
@@ -743,6 +745,206 @@ def handle_broadcast(message: telebot.types.Message):
     if failed > 0:
         reply_msg += f" Не удалось отправить: {failed}."
     bot.reply_to(message, reply_msg)
+
+
+# =========================
+# Admin interactive broadcast
+# =========================
+
+# In-memory state for admin broadcast flows
+_broadcast_states = {}  # admin_id -> {"audience": str, "text": str, "photo": str|None, "step": str}
+
+def _get_recipients_by_audience(audience: str):
+    """
+    audience in {"all","active","inactive"}
+    active = users with at least one non-expired purchase
+    inactive = users with no non-expired purchases
+    """
+    now_ts = int(time.time())
+    recipients = []
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        if audience == "all":
+            cur.execute("SELECT user_id FROM users;")
+        elif audience == "active":
+            cur.execute("SELECT DISTINCT user_id FROM purchases WHERE expiry > ?;", (now_ts,))
+        elif audience == "inactive":
+            cur.execute("SELECT user_id FROM users WHERE user_id NOT IN (SELECT DISTINCT user_id FROM purchases WHERE expiry > ?);", (now_ts,))
+        else:
+            cur.execute("SELECT user_id FROM users;")
+        rows = cur.fetchall()
+        recipients = [r[0] for r in rows]
+        conn.close()
+    except Exception as e:
+        print(f"_get_recipients_by_audience error: {e}")
+    return recipients
+
+def _broadcast_preview_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("✅ Подтвердить", callback_data="adm_bc_confirm"),
+        types.InlineKeyboardButton("❌ Отмена", callback_data="adm_bc_cancel")
+    )
+    kb.row(
+        types.InlineKeyboardButton("✏️ Изменить текст", callback_data="adm_bc_edit_text"),
+        types.InlineKeyboardButton("🖼️ Изменить фото", callback_data="adm_bc_edit_photo")
+    )
+    return kb
+
+def _broadcast_audience_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("Всем", callback_data="adm_bc_aud_all"),
+        types.InlineKeyboardButton("С активной подпиской", callback_data="adm_bc_aud_active")
+    )
+    kb.row(
+        types.InlineKeyboardButton("Без активной подписки", callback_data="adm_bc_aud_inactive"),
+        types.InlineKeyboardButton("Отмена", callback_data="adm_bc_cancel")
+    )
+    return kb
+
+def _broadcast_skip_photo_keyboard():
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("Пропустить фото", callback_data="adm_bc_skip_photo"))
+    kb.add(types.InlineKeyboardButton("Отмена", callback_data="adm_bc_cancel"))
+    return kb
+
+@bot.message_handler(func=lambda m: m.text == "📣 Отправить рассылку")
+def handle_admin_broadcast_entry(message: telebot.types.Message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    _broadcast_states[user_id] = {"audience": None, "text": None, "photo": None, "step": "audience"}
+    bot.send_message(user_id, "Выберите аудиторию для рассылки:", reply_markup=_broadcast_audience_keyboard())
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_bc_aud_"))
+def handle_admin_broadcast_audience(c: telebot.types.CallbackQuery):
+    user_id = c.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.answer_callback_query(c.id)
+        return
+    state = _broadcast_states.get(user_id) or {}
+    if c.data == "adm_bc_aud_all":
+        state["audience"] = "all"
+    elif c.data == "adm_bc_aud_active":
+        state["audience"] = "active"
+    elif c.data == "adm_bc_aud_inactive":
+        state["audience"] = "inactive"
+    else:
+        bot.answer_callback_query(c.id)
+        return
+    state["step"] = "await_text"
+    _broadcast_states[user_id] = state
+    bot.answer_callback_query(c.id)
+    bot.send_message(user_id, "Отправьте текст рассылки одним сообщением.")
+
+@bot.message_handler(func=lambda m: _broadcast_states.get(m.from_user.id, {}).get("step") == "await_text", content_types=['text'])
+def handle_admin_broadcast_text(message: telebot.types.Message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    state = _broadcast_states.get(user_id)
+    if not state:
+        return
+    state["text"] = message.text
+    state["step"] = "await_photo"
+    _broadcast_states[user_id] = state
+    bot.send_message(user_id, "Теперь пришлите фото (необязательно). Можно пропустить:", reply_markup=_broadcast_skip_photo_keyboard())
+
+@bot.message_handler(func=lambda m: _broadcast_states.get(m.from_user.id, {}).get("step") == "await_photo", content_types=['photo'])
+def handle_admin_broadcast_photo(message: telebot.types.Message):
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        return
+    state = _broadcast_states.get(user_id)
+    if not state:
+        return
+    try:
+        photo_sizes = message.photo or []
+        if not photo_sizes:
+            return
+        largest = photo_sizes[-1]
+        state["photo"] = largest.file_id
+    except Exception:
+        state["photo"] = None
+    state["step"] = "confirm"
+    _broadcast_states[user_id] = state
+    _send_broadcast_preview(user_id, state)
+
+@bot.callback_query_handler(func=lambda c: c.data in ("adm_bc_skip_photo", "adm_bc_edit_text", "adm_bc_edit_photo", "adm_bc_confirm", "adm_bc_cancel"))
+def handle_admin_broadcast_callbacks(c: telebot.types.CallbackQuery):
+    user_id = c.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.answer_callback_query(c.id)
+        return
+    state = _broadcast_states.get(user_id)
+    if not state:
+        bot.answer_callback_query(c.id)
+        return
+    data = c.data
+    if data == "adm_bc_skip_photo":
+        state["photo"] = None
+        state["step"] = "confirm"
+        _broadcast_states[user_id] = state
+        bot.answer_callback_query(c.id)
+        _send_broadcast_preview(user_id, state)
+        return
+    if data == "adm_bc_edit_text":
+        state["step"] = "await_text"
+        _broadcast_states[user_id] = state
+        bot.answer_callback_query(c.id)
+        bot.send_message(user_id, "Отправьте новый текст рассылки.")
+        return
+    if data == "adm_bc_edit_photo":
+        state["step"] = "await_photo"
+        state["photo"] = None
+        _broadcast_states[user_id] = state
+        bot.answer_callback_query(c.id)
+        bot.send_message(user_id, "Пришлите новое фото или пропустите:", reply_markup=_broadcast_skip_photo_keyboard())
+        return
+    if data == "adm_bc_cancel":
+        _broadcast_states.pop(user_id, None)
+        bot.answer_callback_query(c.id, "Рассылка отменена.")
+        bot.send_message(user_id, "Отменено.")
+        return
+    if data == "adm_bc_confirm":
+        audience = state.get("audience") or "all"
+        text = state.get("text") or ""
+        photo = state.get("photo")
+        recipients = _get_recipients_by_audience(audience)
+        sent = 0
+        failed = 0
+        for uid in recipients:
+            try:
+                if photo:
+                    bot.send_photo(uid, photo, caption=text)
+                else:
+                    bot.send_message(uid, text, disable_web_page_preview=True)
+                sent += 1
+            except Exception as e:
+                failed += 1
+                if failed <= 3:
+                    print(f"Broadcast send failed to {uid}: {e}")
+        total = len(recipients)
+        _broadcast_states.pop(user_id, None)
+        bot.answer_callback_query(c.id)
+        bot.send_message(user_id, f"Отправлено {sent} из {total}. Не удалось: {failed}.")
+        return
+
+def _send_broadcast_preview(user_id: int, state: dict):
+    try:
+        text = state.get("text") or ""
+        photo = state.get("photo")
+        kb = _broadcast_preview_keyboard()
+        preview_title = "Предпросмотр рассылки:"
+        if photo:
+            bot.send_photo(user_id, photo, caption=f"{preview_title}\n\n{text}", reply_markup=kb)
+        else:
+            bot.send_message(user_id, f"{preview_title}\n\n{text}", reply_markup=kb, disable_web_page_preview=True)
+    except Exception as e:
+        print(f"_send_broadcast_preview error: {e}")
+        bot.send_message(user_id, "Не удалось показать предпросмотр. Попробуйте ещё раз.")
 
 
 def remove_user_from_channel(user_id: int, channel_id: str):
