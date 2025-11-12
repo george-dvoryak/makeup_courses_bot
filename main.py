@@ -19,6 +19,10 @@ from google_sheets import get_courses_data, get_texts_data
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=False)
 
+# In-memory state for Prodamus email collection
+# Format: {user_id: {"course_id": course_id, "order_id": order_id, "price": price, "name": name}}
+prodamus_pending_emails = {}
+
 # --- Webhook / WSGI (PythonAnywhere) support ---
 # Import webhook config from config.py (already processed and normalized)
 try:
@@ -315,7 +319,9 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
     Create Prodamus invoice via API and get invoice_id.
     Returns invoice_id if successful, None otherwise.
     
-    Documentation: https://help.prodamus.ru/payform/integracii/rest-api/instrukcii-dlya-samostoyatelnaya-integracii-servisov
+    Documentation: 
+    - https://help.prodamus.ru/payform/integracii/rest-api/instrukcii-dlya-samostoyatelnaya-integracii-servisov
+    - https://help.prodamus.ru/payform/priyom-oplaty/kak-sozdat-personalnuyu-platyozhnuyu-ssylku
     """
     try:
         # Build API URL
@@ -324,7 +330,8 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
         else:
             api_url = f"https://{PRODAMUS_PAYFORM_URL}/"
         
-        # Prepare request data
+        # Prepare request data according to Prodamus API
+        # For personal payment link, we need: products, order_id, customerEmail or customerPhone
         data = {
             "do": "link",  # Create invoice and get link
             "products[0][name]": product_name[:255] if product_name else "Доступ к курсу",
@@ -333,66 +340,122 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
             "order_id": order_id,
         }
         
+        # Add system ID if configured
         if PRODAMUS_SYSTEM_ID:
             data["sys"] = PRODAMUS_SYSTEM_ID
         
+        # For personal link, at least one contact is required
         if customer_email:
             data["customerEmail"] = customer_email
         
         if customer_phone:
             data["customerPhone"] = customer_phone
         
-        # Make GET or POST request to create invoice
-        # Prodamus API may accept both GET and POST
-        # Try GET first (more common for payment forms)
-        try:
-            response = requests.get(api_url, params=data, allow_redirects=False, timeout=10)
-        except:
-            # Fallback to POST if GET fails
-            response = requests.post(api_url, data=data, allow_redirects=False, timeout=10)
+        # If no contact info, use a placeholder (some setups may require this)
+        if not customer_email and not customer_phone:
+            data["customerEmail"] = "customer@example.com"  # Placeholder
         
         if PRODAMUS_TEST_MODE:
-            print(f"[Prodamus] Create invoice response status: {response.status_code}")
-            print(f"[Prodamus] Create invoice response headers: {dict(response.headers)}")
+            print(f"[Prodamus] Creating invoice with data: {data}")
+            print(f"[Prodamus] Request URL: {api_url}")
         
-        # Check if we got a redirect with invoice_id in Location header
-        if response.status_code in (301, 302, 303, 307, 308):
-            location = response.headers.get("Location", "")
-            # Extract invoice_id from redirect URL
-            # Format: https://payform.ru/?invoice_id=xxx or /?invoice_id=xxx
-            if "invoice_id=" in location:
-                invoice_id = location.split("invoice_id=")[1].split("&")[0].split("?")[0]
+        # Try GET request first (most common for payment forms)
+        response = None
+        try:
+            response = requests.get(api_url, params=data, allow_redirects=True, timeout=15)
+            if PRODAMUS_TEST_MODE:
+                print(f"[Prodamus] GET request successful, status: {response.status_code}")
+        except Exception as e:
+            if PRODAMUS_TEST_MODE:
+                print(f"[Prodamus] GET request failed: {e}, trying POST")
+            # Fallback to POST
+            try:
+                response = requests.post(api_url, data=data, allow_redirects=True, timeout=15)
                 if PRODAMUS_TEST_MODE:
-                    print(f"[Prodamus] Got invoice_id from redirect: {invoice_id}")
+                    print(f"[Prodamus] POST request successful, status: {response.status_code}")
+            except Exception as e2:
+                print(f"[Prodamus] Both GET and POST failed: {e2}")
+                return None
+        
+        if not response:
+            return None
+        
+        # Get final URL after redirects
+        final_url = response.url
+        
+        # Try to extract from response text first (Prodamus returns short link in response text)
+        response_text = response.text.strip()
+        if PRODAMUS_TEST_MODE:
+            print(f"[Prodamus] Final URL after redirects: {final_url}")
+            print(f"[Prodamus] Response text (first 1000 chars): {response_text[:1000]}")
+        
+        # Prodamus may return short link like "https://payform.ru/5h9NArs/" in response text
+        # Extract the short code (invoice_id) from this link
+        if response_text.startswith("http"):
+            # Response is a URL - extract invoice_id from it
+            # Format: https://payform.ru/5h9NArs/ or https://testwork1.payform.ru/?invoice_id=xxx
+            if "invoice_id=" in response_text:
+                invoice_id = response_text.split("invoice_id=")[1].split("&")[0].split("?")[0].split("#")[0].split("/")[0]
+                if invoice_id and len(invoice_id) > 10:
+                    if PRODAMUS_TEST_MODE:
+                        print(f"[Prodamus] Extracted invoice_id from response URL: {invoice_id}")
+                    return invoice_id
+            # Try to extract short code from URL path
+            # Format: https://payform.ru/5h9NArs/ -> invoice_id = 5h9NArs
+            import re
+            match = re.search(r'payform\.ru/([a-zA-Z0-9]+)', response_text)
+            if match:
+                invoice_id = match.group(1)
+                if len(invoice_id) >= 6:  # Short codes are usually 6+ characters
+                    if PRODAMUS_TEST_MODE:
+                        print(f"[Prodamus] Extracted invoice_id from short link: {invoice_id}")
+                    return invoice_id
+        
+        # Extract invoice_id from final URL
+        if "invoice_id=" in final_url:
+            invoice_id = final_url.split("invoice_id=")[1].split("&")[0].split("?")[0].split("#")[0]
+            if invoice_id and len(invoice_id) > 10:  # Basic validation
+                if PRODAMUS_TEST_MODE:
+                    print(f"[Prodamus] Extracted invoice_id from final URL: {invoice_id}")
                 return invoice_id
         
-        # Try to get invoice_id from response text/JSON
-        try:
-            response_data = response.json() if response.headers.get("content-type", "").startswith("application/json") else {}
-            if "invoice_id" in response_data:
-                return response_data["invoice_id"]
-            if "link" in response_data:
-                link = response_data["link"]
-                if "invoice_id=" in link:
-                    invoice_id = link.split("invoice_id=")[1].split("&")[0].split("?")[0]
+        # Look for invoice_id in various formats
+        import re
+        patterns = [
+            r'invoice_id[=:](\w{20,})',  # invoice_id=xxx or invoice_id:xxx
+            r'invoice_id["\']?\s*[:=]\s*["\']?(\w{20,})',  # invoice_id: "xxx"
+            r'<input[^>]*name=["\']invoice_id["\'][^>]*value=["\'](\w{20,})',  # HTML input
+            r'data-invoice-id=["\'](\w{20,})',  # data attribute
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, response_text, re.IGNORECASE)
+            if match:
+                invoice_id = match.group(1)
+                if len(invoice_id) > 10:
+                    if PRODAMUS_TEST_MODE:
+                        print(f"[Prodamus] Extracted invoice_id using pattern {pattern}: {invoice_id}")
                     return invoice_id
+        
+        # Try JSON response
+        try:
+            if response.headers.get("content-type", "").startswith("application/json"):
+                response_data = response.json()
+                if PRODAMUS_TEST_MODE:
+                    print(f"[Prodamus] JSON response: {response_data}")
+                if "invoice_id" in response_data:
+                    return str(response_data["invoice_id"])
+                if "link" in response_data:
+                    link = str(response_data["link"])
+                    if "invoice_id=" in link:
+                        invoice_id = link.split("invoice_id=")[1].split("&")[0].split("?")[0]
+                        return invoice_id
         except:
             pass
         
-        # Try to parse invoice_id from response text
-        response_text = response.text
-        if "invoice_id" in response_text:
-            # Try to extract invoice_id from response
-            import re
-            match = re.search(r'invoice_id[=:](\w+)', response_text)
-            if match:
-                invoice_id = match.group(1)
-                if PRODAMUS_TEST_MODE:
-                    print(f"[Prodamus] Extracted invoice_id from response: {invoice_id}")
-                return invoice_id
-        
         if PRODAMUS_TEST_MODE:
-            print(f"[Prodamus] Could not extract invoice_id from response. Response text: {response_text[:500]}")
+            print(f"[Prodamus] Could not extract invoice_id. Final URL: {final_url}")
+            print(f"[Prodamus] Response status: {response.status_code}")
         
         return None
         
@@ -402,11 +465,9 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
         traceback.print_exc()
         return None
 
-def generate_prodamus_payment_url(order_number: str, amount: float, product_name: str = "", customer_email: str = "", customer_phone: str = "", invoice_id: str = None) -> str:
+def generate_prodamus_payment_url(order_number: str, amount: float, product_name: str = "", customer_email: str = "", customer_phone: str = "") -> str:
     """
-    Generate Prodamus payment URL.
-    If invoice_id is provided, use simple format: https://payform.ru/?invoice_id=xxx
-    Otherwise, try to create invoice via API first.
+    Generate Prodamus payment URL with all parameters.
     
     Documentation: https://help.prodamus.ru/payform/integracii/rest-api/instrukcii-dlya-samostoyatelnaya-integracii-servisov
     
@@ -414,48 +475,12 @@ def generate_prodamus_payment_url(order_number: str, amount: float, product_name
         order_number: Unique order number (used in webhook)
         amount: Payment amount in rubles
         product_name: Product name (required)
-        customer_email: Customer email (optional)
+        customer_email: Customer email (optional, but recommended for pre-filling form)
         customer_phone: Customer phone (optional)
-        invoice_id: Pre-created invoice ID (optional)
     
     Returns:
         Payment URL string
     """
-    # If invoice_id is provided, use simple format
-    if invoice_id:
-        if PRODAMUS_TEST_MODE:
-            base_url = f"https://{PRODAMUS_PAYFORM_URL}/?old_auth=1"
-        else:
-            base_url = f"https://{PRODAMUS_PAYFORM_URL}/"
-        full_url = f"{base_url}&invoice_id={invoice_id}" if "?" in base_url else f"{base_url}?invoice_id={invoice_id}"
-        if PRODAMUS_TEST_MODE:
-            print(f"[Prodamus] Using invoice_id URL: {full_url}")
-        return full_url
-    
-    # Try to create invoice via API first
-    invoice_id = create_prodamus_invoice(
-        order_id=order_number,
-        amount=amount,
-        product_name=product_name,
-        customer_email=customer_email,
-        customer_phone=customer_phone
-    )
-    
-    # If we got invoice_id, use simple format
-    if invoice_id:
-        if PRODAMUS_TEST_MODE:
-            base_url = f"https://{PRODAMUS_PAYFORM_URL}/?old_auth=1"
-        else:
-            base_url = f"https://{PRODAMUS_PAYFORM_URL}/"
-        full_url = f"{base_url}&invoice_id={invoice_id}" if "?" in base_url else f"{base_url}?invoice_id={invoice_id}"
-        if PRODAMUS_TEST_MODE:
-            print(f"[Prodamus] Created invoice, using invoice_id URL: {full_url}")
-        return full_url
-    
-    # Fallback to old format with all parameters if invoice creation failed
-    if PRODAMUS_TEST_MODE:
-        print(f"[Prodamus] Invoice creation failed, falling back to parameter-based URL")
-    
     # Build base URL
     if PRODAMUS_TEST_MODE:
         base_url = f"https://{PRODAMUS_PAYFORM_URL}/?old_auth=1"
@@ -475,16 +500,21 @@ def generate_prodamus_payment_url(order_number: str, amount: float, product_name
         params["sys"] = PRODAMUS_SYSTEM_ID
     
     if customer_email:
-        params["customerEmail"] = customer_email
+        # Try multiple parameter names for email pre-filling
+        # Prodamus may use different parameter names in different setups
+        params["email"] = customer_email  # Simple parameter name
+        params["customerEmail"] = customer_email  # CamelCase variant
+        params["customer_email"] = customer_email  # Snake_case variant
     
     if customer_phone:
         params["customerPhone"] = customer_phone
+        params["customer_phone"] = customer_phone  # Also try snake_case variant
     
     query_string = urlencode(params, doseq=True)
     full_url = f"{base_url}&{query_string}" if "?" in base_url else f"{base_url}?{query_string}"
     
     if PRODAMUS_TEST_MODE:
-        print(f"[Prodamus] Generated payment URL (fallback, test mode): {full_url}")
+        print(f"[Prodamus] Generated payment URL (test mode): {full_url}")
     
     return full_url
 
@@ -645,6 +675,117 @@ def handle_active(message: telebot.types.Message):
 @bot.message_handler(func=lambda m: m.text == "Поддержка")
 def handle_support(message: telebot.types.Message):
     bot.send_message(message.from_user.id, SUPPORT_MSG)
+
+# Handler for email input for Prodamus payments
+@bot.message_handler(func=lambda m: m.from_user.id in prodamus_pending_emails)
+def handle_prodamus_email(message: telebot.types.Message):
+    user_id = message.from_user.id
+    email_text = message.text.strip()
+    
+    # Validate email format
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, email_text):
+        bot.send_message(user_id, "❌ Неверный формат email адреса. Пожалуйста, отправьте корректный email (например: example@mail.ru)")
+        return
+    
+    # Get pending payment info
+    if user_id not in prodamus_pending_emails:
+        bot.send_message(user_id, "❌ Сессия истекла. Пожалуйста, начните оплату заново.")
+        return
+    
+    payment_info = prodamus_pending_emails.pop(user_id)
+    course_id = payment_info["course_id"]
+    order_id = payment_info["order_id"]
+    price = payment_info["price"]
+    clean_name = payment_info["name"]
+    
+    # Save email to user profile
+    try:
+        user = get_user(user_id)
+        if user:
+            # Update user email in database (if you have email field)
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            # Try to add email column if it doesn't exist
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            except sqlite3.OperationalError:
+                pass
+            cur.execute("UPDATE users SET email = ? WHERE user_id = ?", (email_text, user_id))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"Error saving email to user profile: {e}")
+    
+    # Generate payment URL with real email
+    customer_email = email_text
+    customer_phone = ""
+    
+    try:
+        payment_url = generate_prodamus_payment_url(
+            order_number=order_id,
+            amount=price,
+            product_name=clean_name,
+            customer_email=customer_email,
+            customer_phone=customer_phone
+        )
+        
+        # Store payment info in database
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_payments (
+                    invoice_id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    course_id TEXT,
+                    amount REAL,
+                    created_at INTEGER,
+                    payment_system TEXT,
+                    order_id TEXT
+                )
+            """)
+            try:
+                cur.execute("ALTER TABLE pending_payments ADD COLUMN payment_system TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute("ALTER TABLE pending_payments ADD COLUMN order_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+            
+            # Use order_id as primary key
+            cur.execute(
+                "INSERT OR REPLACE INTO pending_payments (invoice_id, user_id, course_id, amount, created_at, payment_system, order_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (order_id, user_id, course_id, price, int(time.time()), "prodamus", order_id)
+            )
+            conn.commit()
+            conn.close()
+            
+            if PRODAMUS_TEST_MODE:
+                print(f"[Prodamus] Stored pending payment with email: order_id={order_id}, email={customer_email}")
+        except Exception as e:
+            print(f"Error storing pending payment: {e}")
+        
+        # Send payment link to user
+        text = f"✅ Email сохранен!\n\n"
+        text += f"💳 Оплата курса: {clean_name}\n\n"
+        text += f"Сумма: {price:.2f} руб.\n\n"
+        text += "Нажмите на кнопку ниже, чтобы перейти к оплате:"
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("💳 Оплатить через Prodamus", url=payment_url))
+        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"course_{course_id}"))
+        
+        bot.send_message(user_id, text, reply_markup=kb)
+        
+        if PRODAMUS_TEST_MODE:
+            print(f"[Prodamus TEST MODE] Generated payment URL with email for order_id {order_id}: {payment_url}")
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Error generating Prodamus payment URL: {error_msg}")
+        bot.send_message(user_id, "❌ Ошибка при создании ссылки на оплату. Пожалуйста, попробуйте позже или обратитесь в поддержку.")
 
 
 # Handler for "Оферта" button
@@ -1035,27 +1176,51 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
 
     # Clean course name for description
     clean_name = strip_html(name)
-    description = f"Оплата доступа к курсу: {clean_name}"
     
-    # Get user email if available (optional)
+    # Check if we have user email saved in database
     customer_email = ""
     try:
         user = get_user(user_id)
-        if user and user.get("email"):
-            customer_email = user["email"]
-    except Exception:
+        if user:
+            # Try to get email from user record (if email column exists)
+            # user is a Row object, so we can access by column name or index
+            if hasattr(user, 'keys') and 'email' in user.keys():
+                customer_email = user['email']
+            elif len(user) > 2:  # If email column exists (after user_id and username)
+                try:
+                    customer_email = user[2]  # Assuming email is 3rd column
+                except:
+                    pass
+    except Exception as e:
+        if PRODAMUS_TEST_MODE:
+            print(f"[Prodamus] Error getting user email: {e}")
         pass
     
-    # Get user phone if available (optional, but may help fill the form)
+    # If no email, request it from user
+    if not customer_email:
+        # Store payment info in memory to continue after email is received
+        prodamus_pending_emails[user_id] = {
+            "course_id": course_id,
+            "order_id": order_id,
+            "price": price,
+            "name": clean_name
+        }
+        
+        # Request email from user
+        text = "📧 Для создания счета на оплату через Prodamus нужен ваш email адрес.\n\n"
+        text += "Пожалуйста, отправьте ваш email адрес:"
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("⬅️ Отмена", callback_data=f"course_{course_id}"))
+        
+        bot.send_message(user_id, text, reply_markup=kb)
+        bot.answer_callback_query(c.id)
+        return
+    
+    # We have email, proceed with payment URL generation
     customer_phone = ""
-    try:
-        # Try to get phone from user data if available
-        # Note: Telegram doesn't provide phone by default, but we can try
-        pass
-    except Exception:
-        pass
     
-    # Generate payment URL (this will try to create invoice via API)
+    # Generate payment URL with all parameters (including email)
     try:
         payment_url = generate_prodamus_payment_url(
             order_number=order_id,
@@ -1064,11 +1229,6 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
             customer_email=customer_email,
             customer_phone=customer_phone
         )
-        
-        # Extract invoice_id from URL if present
-        invoice_id = None
-        if "invoice_id=" in payment_url:
-            invoice_id = payment_url.split("invoice_id=")[1].split("&")[0].split("?")[0]
         
         # Store payment info in database for later verification
         try:
@@ -1097,18 +1257,16 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
                 pass
             
             # Store payment info in database
-            # Use invoice_id as primary key if available, otherwise use order_id
-            primary_key = invoice_id if invoice_id else order_id
-            
+            # Use order_id as primary key (since we're not using invoice_id anymore)
             cur.execute(
                 "INSERT OR REPLACE INTO pending_payments (invoice_id, user_id, course_id, amount, created_at, payment_system, order_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (primary_key, user_id, course_id, price, int(time.time()), "prodamus", order_id)
+                (order_id, user_id, course_id, price, int(time.time()), "prodamus", order_id)
             )
             conn.commit()
             conn.close()
             
             if PRODAMUS_TEST_MODE:
-                print(f"[Prodamus] Stored pending payment: invoice_id={invoice_id or 'N/A'}, order_id={order_id}, user_id={user_id}, course_id={course_id}, amount={price}")
+                print(f"[Prodamus] Stored pending payment: order_id={order_id}, user_id={user_id}, course_id={course_id}, amount={price}, email={customer_email}")
         except Exception as e:
             print(f"Error storing pending payment: {e}")
             import traceback
