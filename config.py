@@ -26,6 +26,21 @@ if not PAYMENT_PROVIDER_TOKEN:
     raise ValueError("PAYMENT_PROVIDER_TOKEN is required. Please set it in .env file")
 CURRENCY = os.getenv("CURRENCY", "RUB")
 
+# === PAYMENTS (Prodamus direct integration) ===
+# Feature flag to show Prodamus buttons/flows in the bot UI
+ENABLE_PRODAMUS = get_bool_env("ENABLE_PRODAMUS", True)
+# Test mode flag (use test environment for development/testing)
+# Set to "True" to use test environment, "False" for production
+PRODAMUS_TEST_MODE = get_bool_env("PRODAMUS_TEST_MODE", True)
+# Payment form URL (test or production)
+# Test: testwork1.payform.ru
+# Production: your production payform domain
+PRODAMUS_PAYFORM_URL = os.getenv("PRODAMUS_PAYFORM_URL", "testwork1.payform.ru")
+# Secret key for webhook verification (from Prodamus dashboard)
+PRODAMUS_SECRET_KEY = os.getenv("PRODAMUS_SECRET_KEY", "")
+# System ID (if required by Prodamus API)
+PRODAMUS_SYSTEM_ID = os.getenv("PRODAMUS_SYSTEM_ID", "")
+
 # === SQLite DB ===
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")
 
