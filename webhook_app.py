@@ -96,6 +96,12 @@ def start_cleanup_scheduler():
 # Start cleanup scheduler when module is imported
 start_cleanup_scheduler()
 
+# Health check endpoint
+@app.route('/', methods=['GET'])
+def health_check():
+    """Health check endpoint to verify app is running"""
+    return "OK", 200
+
 # Reset and set webhook
 if WEBHOOK_URL:
     try:
@@ -112,8 +118,13 @@ if WEBHOOK_URL:
 
 # Webhook endpoint - use WEBHOOK_PATH if available, otherwise fallback to token-based path
 if WEBHOOK_PATH:
-    @app.route(WEBHOOK_PATH, methods=['POST'])
+    @app.route(WEBHOOK_PATH, methods=['POST', 'GET'])
     def telegram_webhook():
+        # GET request - return status for testing
+        if request.method == 'GET':
+            return f"Webhook endpoint active. Path: {WEBHOOK_PATH}", 200
+        
+        # POST request - handle Telegram webhook
         # Validate Telegram secret header if configured
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if WEBHOOK_SECRET_TOKEN and secret != WEBHOOK_SECRET_TOKEN:
