@@ -11,8 +11,15 @@ from main import bot  # handlers are already registered on import
 app = Flask(__name__)
 
 # Background cleanup scheduler
+# Initialize variables at module level to ensure they exist
 _cleanup_thread = None
 _cleanup_running = False
+
+# Ensure variables are in module globals
+if '_cleanup_thread' not in globals():
+    _cleanup_thread = None
+if '_cleanup_running' not in globals():
+    _cleanup_running = False
 
 def run_cleanup():
     """Run expired subscriptions cleanup"""
@@ -85,16 +92,34 @@ def cleanup_scheduler():
 
 def start_cleanup_scheduler():
     """Start the background cleanup scheduler"""
-    global _cleanup_thread
-    if _cleanup_thread is None or not _cleanup_thread.is_alive():
+    global _cleanup_thread, _cleanup_running
+    try:
+        # Try to access _cleanup_thread - if it doesn't exist, NameError will be raised
+        thread = _cleanup_thread
+        if thread is None or not thread.is_alive():
+            _cleanup_thread = threading.Thread(target=cleanup_scheduler, daemon=True)
+            _cleanup_thread.start()
+            print(f"[{datetime.now()}] [Auto-Cleanup] Background cleanup scheduler started (runs every hour + on startup)")
+        else:
+            print(f"[{datetime.now()}] [Auto-Cleanup] Cleanup scheduler already running")
+    except NameError:
+        # Variable doesn't exist - initialize it
         _cleanup_thread = threading.Thread(target=cleanup_scheduler, daemon=True)
         _cleanup_thread.start()
-        print(f"[{datetime.now()}] [Auto-Cleanup] Background cleanup scheduler started (runs every hour + on startup)")
-    else:
-        print(f"[{datetime.now()}] [Auto-Cleanup] Cleanup scheduler already running")
+        print(f"[{datetime.now()}] [Auto-Cleanup] Background cleanup scheduler started (after NameError fix)")
+    except Exception as e:
+        print(f"[{datetime.now()}] [Auto-Cleanup] Error starting scheduler: {e}")
+        import traceback
+        traceback.print_exc()
 
 # Start cleanup scheduler when module is imported
-start_cleanup_scheduler()
+# Wrap in try-except to prevent import errors
+try:
+    start_cleanup_scheduler()
+except Exception as e:
+    print(f"[{datetime.now()}] [Auto-Cleanup] Failed to start scheduler on import: {e}")
+    import traceback
+    traceback.print_exc()
 
 # Health check endpoint
 @app.route('/', methods=['GET'])
