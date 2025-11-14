@@ -40,6 +40,9 @@ PRODAMUS_PAYFORM_URL = os.getenv("PRODAMUS_PAYFORM_URL", "testwork1.payform.ru")
 PRODAMUS_SECRET_KEY = os.getenv("PRODAMUS_SECRET_KEY", "")
 # System ID (if required by Prodamus API)
 PRODAMUS_SYSTEM_ID = os.getenv("PRODAMUS_SYSTEM_ID", "")
+# Test webhook URL for debugging (e.g., webhook.site URL)
+# If set, all webhook data will also be forwarded to this URL for testing
+PRODAMUS_TEST_WEBHOOK_URL = os.getenv("PRODAMUS_TEST_WEBHOOK_URL", "")
 
 # === SQLite DB ===
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")

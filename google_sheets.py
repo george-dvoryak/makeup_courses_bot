@@ -32,7 +32,7 @@ def get_courses_data():
                 "name": (rec.get("name") or rec.get("Name") or rec.get("Название") or "").strip(),
                 "description": (rec.get("description") or rec.get("Description") or rec.get("Описание") or "").strip(),
                 "price": float(rec.get("price") or rec.get("Price") or rec.get("Цена") or 0),
-                "duration_days": int(float(rec.get("duration_days") or rec.get("Duration") or rec.get("Срок") or 0)),
+                "duration_minutes": int(float(rec.get("duration_minutes") or rec.get("Duration") or rec.get("Срок") or 0)),
                 "image_url": (rec.get("image_url") or rec.get("Image") or rec.get("Картинка") or "").strip(),
                 "channel": (rec.get("channel") or rec.get("Channel") or rec.get("Канал") or "").strip(),
             }
@@ -55,7 +55,7 @@ def get_courses_data():
             name = (d.get("name") or d.get("Name") or d.get("Название") or "").strip()
             desc = (d.get("description") or d.get("Description") or d.get("Описание") or "").strip()
             price = d.get("price") or d.get("Price") or d.get("Цена") or "0"
-            duration = d.get("duration_days") or d.get("Duration") or d.get("Срок") or "0"
+            duration = d.get("duration_minutes") or d.get("Duration") or d.get("Срок") or "0"
             image = (d.get("image_url") or d.get("Image") or d.get("Картинка") or "").strip()
             channel = (d.get("channel") or d.get("Channel") or d.get("Канал") or "").strip()
             try:
@@ -71,7 +71,7 @@ def get_courses_data():
                 "name": name,
                 "description": desc,
                 "price": price,
-                "duration_days": duration,
+                "duration_minutes": duration,
                 "image_url": image,
                 "channel": channel
             })

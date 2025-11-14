@@ -56,11 +56,11 @@ def get_user(user_id: int):
     cur.execute("SELECT * FROM users WHERE user_id = ?;", (user_id,))
     return cur.fetchone()
 
-def add_purchase(user_id: int, course_id: str, course_name: str, channel_id: str, duration_days: int, payment_id: str = None):
+def add_purchase(user_id: int, course_id: str, course_name: str, channel_id: str, duration_minutes: int, payment_id: str = None):
     conn = get_connection()
     cur = conn.cursor()
     now = int(time.time())
-    expiry_ts = now + int(duration_days) * 24 * 3600
+    expiry_ts = now + int(duration_minutes) * 60
     cur.execute(
         """
         INSERT INTO purchases (user_id, course_id, course_name, channel_id, expiry, payment_id)
@@ -97,27 +97,35 @@ def has_active_subscription(user_id: int, course_id: str):
     return cur.fetchone() is not None
 
 def mark_subscription_expired(user_id: int, course_id: str):
+    """
+    Mark subscription as expired by setting expiry to 0 (processed flag).
+    Using 0 instead of current time to distinguish processed from unprocessed expired subscriptions.
+    """
     conn = get_connection()
     cur = conn.cursor()
-    now = int(time.time())
     cur.execute(
         """
-        UPDATE purchases SET expiry = ?
+        UPDATE purchases SET expiry = 0
         WHERE user_id = ? AND course_id = ?;
         """,
-        (now, user_id, course_id)
+        (user_id, course_id)
     )
     conn.commit()
 
 def get_expired_subscriptions():
+    """
+    Get subscriptions that have expired but haven't been processed yet.
+    Only returns subscriptions where expiry > 0 (not yet marked as processed).
+    """
     conn = get_connection()
     cur = conn.cursor()
     now = int(time.time())
     cur.execute(
         """
-        SELECT user_id, course_id, course_name, channel_id
+        SELECT user_id, course_id, course_name, channel_id, expiry
         FROM purchases
-        WHERE expiry <= ?;
+        WHERE expiry > 0 AND expiry <= ?
+        ORDER BY expiry ASC;
         """,
         (now,)
     )

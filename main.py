@@ -12,7 +12,7 @@ from urllib.parse import urlencode, quote
 from flask import Flask, request, abort
 import requests
 
-from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, ENABLE_PRODAMUS, PRODAMUS_PAYFORM_URL, PRODAMUS_SECRET_KEY, PRODAMUS_TEST_MODE, PRODAMUS_SYSTEM_ID
+from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, ENABLE_PRODAMUS, PRODAMUS_PAYFORM_URL, PRODAMUS_SECRET_KEY, PRODAMUS_TEST_MODE, PRODAMUS_SYSTEM_ID, PRODAMUS_TEST_WEBHOOK_URL
 from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions
 from google_sheets import get_courses_data, get_texts_data
 
@@ -70,6 +70,24 @@ def _diag():
         report = f"diag error: {e}"
     return report, 200
 
+# Helper function to forward webhook data to test URL
+def forward_to_test_webhook(endpoint_name: str, data: dict, method: str = "GET"):
+    """Forward webhook data to test webhook URL (e.g., webhook.site) for debugging"""
+    if not PRODAMUS_TEST_WEBHOOK_URL:
+        return
+    
+    try:
+        test_data = {
+            "endpoint": endpoint_name,
+            "method": method,
+            "data": data,
+            "timestamp": time.time()
+        }
+        requests.post(PRODAMUS_TEST_WEBHOOK_URL, json=test_data, timeout=5)
+        print(f"[Prodamus Test] Forwarded {endpoint_name} data to test webhook")
+    except Exception as e:
+        print(f"[Prodamus Test] Failed to forward to test webhook: {e}")
+
 # Prodamus webhook handlers (Success/Fail/Result URLs)
 @application.route("/prodamus/result", methods=["GET", "POST"])
 def prodamus_result():
@@ -85,8 +103,16 @@ def prodamus_result():
         else:
             data = request.form.to_dict() if request.form else request.get_json() or {}
         
+        # For POST requests, check signature in header (Prodamus sends it as 'sign' header)
+        if request.method == "POST" and "sign" in request.headers:
+            data["signature"] = request.headers.get("sign", "")
+        
         # Log the notification for debugging
         print(f"[Prodamus Result] Received notification: {data}")
+        print(f"[Prodamus Result] Request headers: {dict(request.headers)}")
+        
+        # Forward to test webhook if configured
+        forward_to_test_webhook("result", data, request.method)
         
         # Verify signature if secret key is configured
         if PRODAMUS_SECRET_KEY:
@@ -95,10 +121,12 @@ def prodamus_result():
                 return "ERROR: Invalid signature", 400
         
         # Extract required parameters
-        # Prodamus may send order_id or order parameter
-        order_number = data.get("order_id", "") or data.get("order", "")
+        # Prodamus may send order_id, order, or order_num parameter
+        # order_num is used in Result URL POST requests
+        order_number = data.get("order_num", "") or data.get("order_id", "") or data.get("order", "")
         amount = data.get("sum", "") or data.get("amount", "")
-        payment_status = data.get("status", "").lower()
+        # Prodamus may send status or payment_status
+        payment_status = (data.get("payment_status", "") or data.get("status", "")).lower()
         
         if not order_number or not amount:
             print(f"[Prodamus Result] Missing required parameters. Received data: {data}")
@@ -121,12 +149,18 @@ def prodamus_result():
                     course_id TEXT,
                     amount REAL,
                     created_at INTEGER,
-                    payment_system TEXT
+                    payment_system TEXT,
+                    order_id TEXT
                 )
             """)
-            # Add payment_system column if it doesn't exist (migration)
+            # Add columns if they don't exist (migration)
             try:
                 cur.execute("ALTER TABLE pending_payments ADD COLUMN payment_system TEXT")
+            except sqlite3.OperationalError:
+                # Column already exists, ignore
+                pass
+            try:
+                cur.execute("ALTER TABLE pending_payments ADD COLUMN order_id TEXT")
             except sqlite3.OperationalError:
                 # Column already exists, ignore
                 pass
@@ -157,14 +191,14 @@ def prodamus_result():
                     return "ERROR: Course not found", 404
                 
                 course_name = course.get("name", f"ID {course_id}")
-                duration = int(course.get("duration_days", 0))
+                duration = int(course.get("duration_minutes", 0))
                 channel = str(course.get("channel", ""))
                 
                 # Add purchase to database
                 expiry_ts = add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"prodamus_{order_number}")
                 
-                # Remove from pending payments
-                cur.execute("DELETE FROM pending_payments WHERE invoice_id = ?", (order_number,))
+                # Remove from pending payments (use order_id to match storage pattern)
+                cur.execute("DELETE FROM pending_payments WHERE order_id = ?", (order_number,))
                 conn.commit()
                 conn.close()
                 
@@ -227,6 +261,9 @@ def prodamus_success():
         
         print(f"[Prodamus Success] User redirected: {data}")
         
+        # Forward to test webhook if configured
+        forward_to_test_webhook("success", data, request.method)
+        
         # Return a simple success page or redirect
         return "Payment successful! You can close this page.", 200
     except Exception as e:
@@ -245,6 +282,9 @@ def prodamus_fail():
             data = request.form.to_dict() if request.form else request.get_json() or {}
         
         print(f"[Prodamus Fail] User redirected: {data}")
+        
+        # Forward to test webhook if configured
+        forward_to_test_webhook("fail", data, request.method)
         
         # Return a simple failure page or redirect
         return "Payment failed. Please try again.", 200
@@ -295,9 +335,10 @@ def generate_prodamus_signature(data: dict, secret_key: str) -> str:
     """
     Generate Prodamus webhook signature.
     Format: MD5 hash of sorted key-value pairs + secret key
+    According to Prodamus docs: sort all parameters except 'sign'/'signature', join with &, add secret key, calculate MD5
     """
-    # Sort keys alphabetically
-    sorted_keys = sorted([k for k in data.keys() if k != 'signature'])
+    # Sort keys alphabetically, exclude signature-related keys
+    sorted_keys = sorted([k for k in data.keys() if k not in ('signature', 'sign')])
     # Build signature string
     signature_string = '&'.join([f"{k}={data[k]}" for k in sorted_keys])
     signature_string += f"&{secret_key}"
@@ -307,11 +348,20 @@ def generate_prodamus_signature(data: dict, secret_key: str) -> str:
 def verify_prodamus_signature(data: dict, secret_key: str) -> bool:
     """
     Verify Prodamus webhook signature.
+    Prodamus may send signature as 'sign' (in header) or 'signature' (in body)
     """
-    if 'signature' not in data:
+    # Check for signature in data (can be 'sign' or 'signature')
+    received_signature = data.get('signature', '') or data.get('sign', '')
+    if not received_signature:
+        print(f"[Prodamus] No signature found in data")
         return False
-    received_signature = data.get('signature', '').lower()
+    
+    received_signature = received_signature.lower()
     calculated_signature = generate_prodamus_signature(data, secret_key).lower()
+    
+    if PRODAMUS_TEST_MODE:
+        print(f"[Prodamus] Signature verification: received={received_signature[:20]}..., calculated={calculated_signature[:20]}...")
+    
     return received_signature == calculated_signature
 
 def create_prodamus_invoice(order_id: str, amount: float, product_name: str = "", customer_email: str = "", customer_phone: str = "") -> str:
@@ -901,7 +951,7 @@ def cb_course(c: telebot.types.CallbackQuery):
     name = course.get("name", "")
     desc = course.get("description", "")
     price = course.get("price", 0)
-    duration = course.get("duration_days", 0)
+    duration = course.get("duration_minutes", 0)
     image_url = course.get("image_url", "")
     channel_id = course.get("channel", "")
 
@@ -938,7 +988,7 @@ def cb_course(c: telebot.types.CallbackQuery):
 
     # Strip HTML from description too
     clean_desc = strip_html(desc) if desc else ""
-    text = f"{formatted_name}\n{clean_desc}\n\nЦена: {price} руб.\nДоступ: {duration} дн."
+    text = f"{formatted_name}\n{clean_desc}\n\nЦена: {price} руб.\nДоступ: {duration} мин."
     ikb = types.InlineKeyboardMarkup()
     # Add payment buttons
     if ENABLE_PRODAMUS and PRODAMUS_SECRET_KEY:
@@ -1339,7 +1389,7 @@ def handle_successful_payment(message: telebot.types.Message):
         courses = []
     course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
     course_name = course.get("name", f"ID {course_id}") if course else f"ID {course_id}"
-    duration = int(course.get("duration_days", 0)) if course else 0
+    duration = int(course.get("duration_minutes", 0)) if course else 0
     channel = str(course.get("channel", "")) if course else ""
 
     expiry_ts = add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=payment.telegram_payment_charge_id)
@@ -1400,6 +1450,86 @@ def send_receipt_to_tax(user_id: int, course_name: str, amount: float, buyer_ema
     print(f"[Receipt] user={user_id}, product='{course_name}', amount={amount}, email={buyer_email}")
 
 # Admin broadcasts
+@bot.message_handler(commands=['cleanup_expired'])
+def handle_cleanup_expired(message: telebot.types.Message):
+    """Admin command to manually trigger expired subscriptions cleanup"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    bot.reply_to(message, "🔄 Запуск очистки просроченных подписок...")
+    
+    try:
+        from db import get_expired_subscriptions, mark_subscription_expired, get_connection
+        import time as time_module
+        
+        # Run diagnostics
+        conn = get_connection()
+        cur = conn.cursor()
+        now = int(time_module.time())
+        
+        cur.execute("SELECT COUNT(*) FROM purchases WHERE expiry > 0 AND expiry <= ?", (now,))
+        expired_count = cur.fetchone()[0]
+        
+        cur.execute("SELECT COUNT(*) FROM purchases WHERE expiry > ?", (now,))
+        active_count = cur.fetchone()[0]
+        
+        report = f"📊 Статистика:\n"
+        report += f"• Просроченных (необработанных): {expired_count}\n"
+        report += f"• Активных: {active_count}\n\n"
+        
+        if expired_count == 0:
+            bot.reply_to(message, report + "✅ Просроченных подписок не найдено.")
+            return
+        
+        # Process expired subscriptions
+        expired = get_expired_subscriptions()
+        processed = 0
+        failed = 0
+        
+        for rec in expired:
+            try:
+                user_id = rec["user_id"]
+                course_id = rec["course_id"]
+                course_name = rec["course_name"]
+                channel_id = rec["channel_id"]
+                
+                if channel_id:
+                    ok = remove_user_from_channel(user_id, channel_id)
+                    if not ok:
+                        # Double check
+                        try:
+                            member = bot.get_chat_member(channel_id, user_id)
+                            status = getattr(member, "status", "unknown")
+                            if status in ("left", "kicked"):
+                                ok = True
+                        except:
+                            ok = True  # Assume removed if can't check
+                
+                mark_subscription_expired(user_id, course_id)
+                
+                # Try to notify user
+                try:
+                    clean_course_name = strip_html(course_name) if course_name else "курсу"
+                    bot.send_message(user_id, f"Доступ к курсу {clean_course_name} завершен. Спасибо, что были с нами!")
+                except:
+                    pass
+                
+                processed += 1
+            except Exception as e:
+                failed += 1
+                print(f"Error processing expired subscription: {e}")
+        
+        report += f"✅ Обработано: {processed}\n"
+        if failed > 0:
+            report += f"⚠️ Ошибок: {failed}"
+        
+        bot.reply_to(message, report)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка при очистке: {e}")
+        import traceback
+        print(f"Cleanup error: {traceback.format_exc()}")
+
 @bot.message_handler(commands=['broadcast_all', 'broadcast_buyers', 'broadcast_nonbuyers'])
 def handle_broadcast(message: telebot.types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -1449,12 +1579,78 @@ def handle_broadcast(message: telebot.types.Message):
 
 
 def remove_user_from_channel(user_id: int, channel_id: str):
+    """
+    Remove user from channel by banning and immediately unbanning.
+    This effectively removes the user from the channel.
+    """
+    import datetime
+    timestamp = datetime.datetime.now().isoformat()
+    
+    if not channel_id:
+        print(f"[{timestamp}] [remove_user_from_channel] ERROR: No channel_id provided for user {user_id}")
+        return False
+    
+    print(f"[{timestamp}] [remove_user_from_channel] Starting removal process: user_id={user_id}, channel_id={channel_id}")
+    
+    # First, check if user is actually a member before attempting removal
     try:
-        bot.ban_chat_member(chat_id=channel_id, user_id=user_id)
-        bot.unban_chat_member(chat_id=channel_id, user_id=user_id)
-        return True
+        print(f"[{timestamp}] [remove_user_from_channel] Checking user membership status...")
+        member = bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+        member_status = getattr(member, "status", "unknown")
+        print(f"[{timestamp}] [remove_user_from_channel] User {user_id} current status in channel {channel_id}: {member_status}")
+        
+        if member_status in ("left", "kicked"):
+            print(f"[{timestamp}] [remove_user_from_channel] User {user_id} already not a member (status: {member_status}), skipping removal")
+            return True
     except Exception as e:
-        print(f"Failed to remove {user_id} from {channel_id}: {e}")
+        error_msg = str(e).lower()
+        print(f"[{timestamp}] [remove_user_from_channel] Warning: Could not check membership status: {e}")
+        # Continue with removal attempt anyway
+    
+    try:
+        print(f"[{timestamp}] [remove_user_from_channel] Attempting to ban user {user_id} from channel {channel_id}...")
+        # First, try to ban the user (removes them from channel)
+        bot.ban_chat_member(chat_id=channel_id, user_id=user_id, until_date=None)
+        print(f"[{timestamp}] [remove_user_from_channel] Successfully banned user {user_id}")
+        
+        # Then immediately unban (allows them to rejoin if needed, but they're already removed)
+        print(f"[{timestamp}] [remove_user_from_channel] Unbanning user {user_id}...")
+        bot.unban_chat_member(chat_id=channel_id, user_id=user_id, only_if_banned=True)
+        print(f"[{timestamp}] [remove_user_from_channel] Successfully unbanned user {user_id}")
+        
+        # Verify removal by checking status again
+        try:
+            member = bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            final_status = getattr(member, "status", "unknown")
+            print(f"[{timestamp}] [remove_user_from_channel] Verification: User {user_id} final status: {final_status}")
+            if final_status in ("left", "kicked"):
+                print(f"[{timestamp}] [remove_user_from_channel] ✅ SUCCESS: User {user_id} successfully removed from channel {channel_id}")
+                return True
+            else:
+                print(f"[{timestamp}] [remove_user_from_channel] ⚠️ WARNING: User {user_id} still has status '{final_status}' after ban/unban")
+                return True  # Still return True as ban/unban succeeded
+        except Exception as verify_e:
+            print(f"[{timestamp}] [remove_user_from_channel] Could not verify removal status: {verify_e}")
+            # If we can't verify but ban/unban succeeded, assume success
+            print(f"[{timestamp}] [remove_user_from_channel] ✅ SUCCESS: Ban/unban completed, assuming removal successful")
+            return True
+            
+    except Exception as e:
+        error_msg = str(e).lower()
+        print(f"[{timestamp}] [remove_user_from_channel] ERROR during ban/unban: {e}")
+        print(f"[{timestamp}] [remove_user_from_channel] Error type: {type(e).__name__}")
+        
+        # Check if user is already not a member
+        if any(s in error_msg for s in ("user not found", "user is not a member", "chat not found")):
+            print(f"[{timestamp}] [remove_user_from_channel] User {user_id} already not a member of {channel_id} (error indicates this)")
+            return True
+        
+        # Check if bot doesn't have admin rights
+        if any(s in error_msg for s in ("not enough rights", "not an admin", "can't ban", "can't restrict")):
+            print(f"[{timestamp}] [remove_user_from_channel] ❌ FAILED: Bot doesn't have admin rights in {channel_id}: {e}")
+            return False
+        
+        print(f"[{timestamp}] [remove_user_from_channel] ❌ FAILED: Unknown error removing {user_id} from {channel_id}: {e}")
         return False
 
 

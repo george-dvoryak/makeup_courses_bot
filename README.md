@@ -21,7 +21,7 @@
 
 ## Google Sheets
 Два листа: **Courses** и **Texts**.
-- Courses: `id, name, description, price, duration_days, image_url, channel`
+- Courses: `id, name, description, price, duration_minutes, image_url, channel`
 - Texts: `key, value` (например: `welcome_message`, `support_message`, `catalog_title`, `welcome_image_url`, `catalog_image_url`, `catalog_text`)
 
 Для простоты используйте публикацию листов как CSV:     File → Publish to the web → выбрать лист → получить CSV. Установите `GSHEET_ID` и имена листов в `.env` файле.
@@ -74,23 +74,97 @@ cp .env.example .env
 3. `python main.py` (по умолчанию polling, если `USE_WEBHOOK` не включен).
 
 ## PythonAnywhere (webhook)
-1. Загрузите проект (например, в `/home/<username>/makeup_courses_bot`).
-2. В **Web** → **Add a new web app** → Flask → укажите Python 3.X.
-3. В WSGI-файле добавьте:
+
+**📖 Полная инструкция по развертыванию**: См. [PYTHONANYWHERE_DEPLOYMENT.md](PYTHONANYWHERE_DEPLOYMENT.md)
+
+### Краткая инструкция:
+
+1. Загрузите проект (через Git или Files tab)
+2. Установите зависимости: `pip install --user -r requirements.txt`
+3. Создайте `.env` файл с необходимыми переменными
+4. Создайте Web app (Flask, Python 3.10+)
+5. В WSGI-файле:
    ```python
    import sys
    path = '/home/<username>/makeup_courses_bot'
    if path not in sys.path:
-       sys.path.append(path)
+       sys.path.insert(0, path)
    from webhook_app import app as application
    ```
-4. В `config.py` установите `USE_WEBHOOK=True`, `WEBHOOK_HOST='<username>.pythonanywhere.com'`.
-5. Перезапустите web app — webhook установится автоматически (см. логи).
+6. Перезагрузите web app
 
-## Удаление просроченных подписок (cron)
-На PythonAnywhere → **Tasks**:
-- Команда: `python /home/<username>/makeup_courses_bot/remove_expired.py`
-- Периодичность: ежедневно (или чаще на платном тарифе).
+**Автоматическая очистка**: Встроена в код! Очистка запускается:
+- При старте web app
+- Каждый час автоматически в фоновом режиме
+
+Логи можно увидеть в Error log в разделе Web.
+
+## Удаление просроченных подписок (автоматическое)
+
+### Автоматическая очистка встроена в код!
+
+При использовании `webhook_app.py` (PythonAnywhere), очистка запускается автоматически:
+- ✅ **При старте web app** - сразу после запуска
+- ✅ **Каждый час** - автоматически в фоновом режиме
+
+Логи можно увидеть в Error log в разделе Web PythonAnywhere.
+
+### Дополнительные варианты (опционально)
+
+Если вы хотите более частую очистку или используете локальный запуск:
+
+#### Вариант 1: Локальный Linux/Mac (cron)
+
+1. Откройте crontab для редактирования:
+   ```bash
+   crontab -e
+   ```
+
+2. Добавьте строку для запуска каждые 5 минут:
+   ```bash
+   */5 * * * * cd /path/to/makeup_courses_bot && /usr/bin/python3 remove_expired.py >> /path/to/makeup_courses_bot/cleanup.log 2>&1
+   ```
+
+   Или используйте helper script:
+   ```bash
+   */5 * * * * /path/to/makeup_courses_bot/run_cleanup.sh >> /path/to/makeup_courses_bot/cleanup.log 2>&1
+   ```
+
+3. Сохраните и выйдите (в nano: Ctrl+X, затем Y, затем Enter)
+
+4. Проверьте, что cron работает:
+   ```bash
+   crontab -l
+   ```
+
+#### Вариант 2: Windows (Task Scheduler)
+
+1. Откройте **Task Scheduler** (Планировщик заданий)
+2. Создайте новую задачу:
+   - **Trigger**: По расписанию, каждые 5 минут
+   - **Action**: Запустить программу
+   - **Program**: `python.exe` (или полный путь к python)
+   - **Arguments**: `remove_expired.py`
+   - **Start in**: Путь к папке проекта
+
+#### Вариант 3: Ручной запуск через бота (для тестирования)
+
+Админы могут запустить очистку вручную через команду:
+```
+/cleanup_expired
+```
+
+### Проверка работы
+
+1. Проверьте логи скрипта (если настроены)
+2. Используйте команду `/cleanup_expired` в боте для проверки статистики
+3. Проверьте, что пользователи действительно удаляются из каналов после истечения времени
+
+### Рекомендации по частоте запуска
+
+- **Каждые 5 минут**: для точного удаления (рекомендуется)
+- **Каждые 15 минут**: компромисс между точностью и нагрузкой
+- **Каждый час**: минимальная частота, но возможна задержка до часа
 
 ## YooKassa и фискализация
 - Подключите YooKassa к боту (BotFather → Payments → YooKassa).
@@ -98,9 +172,11 @@ cp .env.example .env
 - В `main.py` функция `send_receipt_to_tax` — заглушка для кастомной интеграции.
 
 ## Команды админа
-- `/broadcast_all <текст>`
-- `/broadcast_buyers <текст>`
-- `/broadcast_nonbuyers <текст>`
+- `/broadcast_all <текст>` - рассылка всем пользователям
+- `/broadcast_buyers <текст>` - рассылка только покупателям
+- `/broadcast_nonbuyers <текст>` - рассылка только непокупателям
+- `/cleanup_expired` - вручную запустить очистку просроченных подписок (показывает статистику и обрабатывает)
+- `/diag_channels` - диагностика каналов курсов (проверка прав бота)
 
 ## Замечания
 - Проверка повторной покупки реализована.
