@@ -61,7 +61,12 @@ def run_cleanup():
                     clean_course_name = strip_html(course_name) if course_name else "курсу"
                     bot.send_message(user_id, f"Доступ к курсу {clean_course_name} завершен. Спасибо, что были с нами!")
                 except Exception as e:
-                    print(f"[{datetime.now()}] [Auto-Cleanup] Failed to notify user {user_id}: {e}")
+                    error_msg = str(e).lower()
+                    # Ignore "chat not found" errors (user blocked bot or deleted chat)
+                    if "chat not found" in error_msg or "bot was blocked" in error_msg:
+                        print(f"[{datetime.now()}] [Auto-Cleanup] User {user_id} blocked bot or chat not found, skipping notification")
+                    else:
+                        print(f"[{datetime.now()}] [Auto-Cleanup] Failed to notify user {user_id}: {e}")
                 
                 processed += 1
             except Exception as e:
@@ -150,35 +155,42 @@ if WEBHOOK_PATH:
             return f"Webhook endpoint active. Path: {WEBHOOK_PATH}", 200
         
         # POST request - handle Telegram webhook
+        # Use sys.stderr for Error log visibility
+        import sys
+        print(f"[{datetime.now()}] [Webhook] Received POST request", file=sys.stderr)
         print(f"[{datetime.now()}] [Webhook] Received POST request")
         
         # Validate Telegram secret header if configured
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if WEBHOOK_SECRET_TOKEN:
             if secret != WEBHOOK_SECRET_TOKEN:
-                print(f"[{datetime.now()}] [Webhook] ❌ Invalid secret token")
+                print(f"[{datetime.now()}] [Webhook] ❌ Invalid secret token", file=sys.stderr)
                 abort(403)
             else:
-                print(f"[{datetime.now()}] [Webhook] ✅ Secret token validated")
+                print(f"[{datetime.now()}] [Webhook] ✅ Secret token validated", file=sys.stderr)
         
         try:
             json_str = request.get_data().decode('utf-8')
-            print(f"[{datetime.now()}] [Webhook] Received data: {len(json_str)} bytes")
+            print(f"[{datetime.now()}] [Webhook] Received data: {len(json_str)} bytes", file=sys.stderr)
             
             update = telebot.types.Update.de_json(json_str)
             
             # Log update type
             if update.message:
-                print(f"[{datetime.now()}] [Webhook] Processing message from user {update.message.from_user.id}")
+                user_id = update.message.from_user.id
+                text = update.message.text or ""
+                print(f"[{datetime.now()}] [Webhook] Processing message from user {user_id}: {text[:50]}", file=sys.stderr)
             elif update.callback_query:
-                print(f"[{datetime.now()}] [Webhook] Processing callback_query from user {update.callback_query.from_user.id}")
+                user_id = update.callback_query.from_user.id
+                data = update.callback_query.data or ""
+                print(f"[{datetime.now()}] [Webhook] Processing callback_query from user {user_id}: {data[:50]}", file=sys.stderr)
             
             bot.process_new_updates([update])
-            print(f"[{datetime.now()}] [Webhook] ✅ Update processed successfully")
+            print(f"[{datetime.now()}] [Webhook] ✅ Update processed successfully", file=sys.stderr)
         except Exception as e:
-            print(f"[{datetime.now()}] [Webhook] ❌ Error processing update: {e}")
+            print(f"[{datetime.now()}] [Webhook] ❌ Error processing update: {e}", file=sys.stderr)
             import traceback
-            traceback.print_exc()
+            traceback.print_exc(file=sys.stderr)
         
         return "OK", 200
 else:
