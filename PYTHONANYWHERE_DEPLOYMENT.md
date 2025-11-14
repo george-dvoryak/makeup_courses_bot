@@ -30,7 +30,8 @@ Complete guide for deploying the Telegram bot to PythonAnywhere.
    git clone -b feature/remove-robocasa https://github.com/george-dvoryak/makeup_courses_bot.git makeup_courses_bot
    # When prompted:
    # Username: gosha.dvoryak@gmail.com
-   # Password: <your-personal-access-token> (NOT your GitHub password!) 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
+   # Password: <your-personal-access-token> (NOT your GitHub password!) 
+   # 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
    cd makeup_courses_bot
    ```
    
@@ -96,6 +97,8 @@ USE_WEBHOOK=True
 WEBHOOK_HOST=yourusername.pythonanywhere.com
 WEBHOOK_PATH=/webhook
 WEBHOOK_SECRET_TOKEN=your_secret_token_here
+# Generate with: python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# See WEBHOOK_SECRET_TOKEN_GUIDE.md for details
 
 # Database
 DATABASE_PATH=/home/yourusername/makeup_courses_bot/bot.db
@@ -116,7 +119,11 @@ PRODAMUS_SYSTEM_ID=your_system_id
 2. Click **Add a new web app**
 3. Choose **Flask**
 4. Select Python version (3.10 recommended)
-5. Set path: `/home/<your-username>/makeup_courses_bot`
+5. **IMPORTANT**: When prompted for path, you can either:
+   - **Option A**: Enter `/home/<your-username>/makeup_courses_bot/webhook_app.py` (full path to Flask app file)
+   - **Option B**: Enter any valid Python filename like `/home/<your-username>/makeup_courses_bot/flask_app.py` (we'll replace the WSGI file content anyway)
+   
+   **Note**: Don't worry if Quickstart creates a default Flask app - we'll replace the WSGI file content in the next step.
 
 ## Step 5: Configure WSGI File
 
@@ -189,6 +196,31 @@ Even though cleanup runs automatically in code, you can also set up a scheduled 
 4. Save
 
 **Note**: This is optional since cleanup already runs automatically in the code.
+
+## Keeping Bot Always Running
+
+### How It Works
+
+Your bot runs as a **Flask web app** which:
+- ✅ Starts automatically when web app loads
+- ✅ Restarts when you click **Reload** in Web tab
+- ✅ On **free tier**: Sleeps after inactivity but wakes up automatically when Telegram sends webhooks
+- ✅ On **paid tier**: Stays active 24/7 automatically
+- ✅ Background cleanup runs automatically in the same process
+
+### No Always-On Task Needed!
+
+Since you're using **webhook mode** (recommended), the web app handles everything. You don't need an always-on task.
+
+**To restart manually:**
+- Go to **Web** tab → Click **Reload** button
+- Check **Error log** to verify startup messages
+
+**To verify bot is running:**
+- Send `/start` command to your bot in Telegram
+- Check **Error log** for `Webhook set to:` and `[Auto-Cleanup]` messages
+
+For more details, see [PYTHONANYWHERE_ALWAYS_RUNNING.md](PYTHONANYWHERE_ALWAYS_RUNNING.md)
 
 ## Troubleshooting
 
@@ -265,17 +297,26 @@ Even though cleanup runs automatically in code, you can also set up a scheduled 
 
 ## Updating Code
 
+For detailed instructions, see [UPDATE_CODE_PYTHONANYWHERE.md](UPDATE_CODE_PYTHONANYWHERE.md)
+
+**Quick steps:**
+
 1. **If using Git**:
    ```bash
    cd ~/makeup_courses_bot
    git pull
    ```
 
-2. **If uploading files**: Upload new files via Files tab
+2. **Install new dependencies** (if any):
+   ```bash
+   pip install --user -r requirements.txt
+   ```
 
 3. **Reload web app**: Web tab → Reload button
 
 4. **Check logs**: Verify no errors after reload
+
+5. **Test bot**: Send `/start` command to verify it works
 
 ## Free Tier Limitations
 

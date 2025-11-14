@@ -41,13 +41,21 @@ GSHEET_ID=your_sheet_id
 USE_WEBHOOK=True
 WEBHOOK_HOST=yourusername.pythonanywhere.com
 WEBHOOK_PATH=/webhook
+WEBHOOK_SECRET_TOKEN=your_secret_token_here
 DATABASE_PATH=/home/yourusername/makeup_courses_bot/bot.db
 ```
+
+**Generate WEBHOOK_SECRET_TOKEN:**
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+```
+Copy the output and use it as `WEBHOOK_SECRET_TOKEN` value.
+See [WEBHOOK_SECRET_TOKEN_GUIDE.md](WEBHOOK_SECRET_TOKEN_GUIDE.md) for details.
 
 ### 4. Create Web App
 - **Web** tab → **Add a new web app**
 - Flask, Python 3.10
-- Path: `/home/<username>/makeup_courses_bot`
+- **Path**: Enter `/home/<username>/makeup_courses_bot/webhook_app.py` (or any `.py` file path - we'll configure WSGI manually)
 
 ### 5. Configure WSGI
 Replace WSGI file content with:
@@ -68,11 +76,17 @@ Send `/start` to your bot in Telegram
 
 ## ✅ That's It!
 
-Cleanup runs automatically:
+**Bot runs automatically:**
+- Starts when web app loads ✅
+- Restarts when you reload web app ✅
+- Wakes up automatically on free tier (when Telegram sends webhooks) ✅
+- Stays active 24/7 on paid tier ✅
+
+**Cleanup runs automatically:**
 - On startup ✅
 - Every hour ✅
 
-No cron setup needed!
+**No always-on task or cron setup needed!** The web app handles everything.
 
 ## 📋 Verify Everything Works
 
