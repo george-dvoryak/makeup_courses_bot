@@ -150,16 +150,36 @@ if WEBHOOK_PATH:
             return f"Webhook endpoint active. Path: {WEBHOOK_PATH}", 200
         
         # POST request - handle Telegram webhook
+        print(f"[{datetime.now()}] [Webhook] Received POST request")
+        
         # Validate Telegram secret header if configured
         secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        if WEBHOOK_SECRET_TOKEN and secret != WEBHOOK_SECRET_TOKEN:
-            abort(403)
+        if WEBHOOK_SECRET_TOKEN:
+            if secret != WEBHOOK_SECRET_TOKEN:
+                print(f"[{datetime.now()}] [Webhook] ❌ Invalid secret token")
+                abort(403)
+            else:
+                print(f"[{datetime.now()}] [Webhook] ✅ Secret token validated")
+        
         try:
             json_str = request.get_data().decode('utf-8')
+            print(f"[{datetime.now()}] [Webhook] Received data: {len(json_str)} bytes")
+            
             update = telebot.types.Update.de_json(json_str)
+            
+            # Log update type
+            if update.message:
+                print(f"[{datetime.now()}] [Webhook] Processing message from user {update.message.from_user.id}")
+            elif update.callback_query:
+                print(f"[{datetime.now()}] [Webhook] Processing callback_query from user {update.callback_query.from_user.id}")
+            
             bot.process_new_updates([update])
+            print(f"[{datetime.now()}] [Webhook] ✅ Update processed successfully")
         except Exception as e:
-            print("Webhook handling error:", e)
+            print(f"[{datetime.now()}] [Webhook] ❌ Error processing update: {e}")
+            import traceback
+            traceback.print_exc()
+        
         return "OK", 200
 else:
     # Fallback to old token-based path for backward compatibility
