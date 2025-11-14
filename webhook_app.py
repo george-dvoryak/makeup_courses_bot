@@ -1,10 +1,18 @@
-from flask import Flask
+# webhook_app.py
+from flask import Flask, request, abort
+import telebot
+import threading
+import time
+from datetime import datetime
+
+from config import TELEGRAM_BOT_TOKEN, WEBHOOK_URL, WEBHOOK_PATH, WEBHOOK_SECRET_TOKEN
+from main import bot  # handlers are already registered on import
 
 app = Flask(__name__)
 
-@app.route('/')
-def hello_world():
-    return 'Hello from Flask!'
+# Background cleanup scheduler
+_cleanup_thread = None
+_cleanup_running = False
 
 def run_cleanup():
     """Run expired subscriptions cleanup"""
