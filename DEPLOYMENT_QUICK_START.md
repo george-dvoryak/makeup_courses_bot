@@ -3,12 +3,28 @@
 ## 🚀 Fast Deployment Checklist
 
 ### 1. Upload Code
+
+**Option A: Using SSH (Recommended)**
 ```bash
 # On PythonAnywhere Bash console:
 cd ~
-git clone <your-repo-url> makeup_courses_bot
+# Clone specific branch using SSH
+git clone -b feature/remove-robocasa git@github.com:george-dvoryak/makeup_courses_bot.git makeup_courses_bot
 cd makeup_courses_bot
 ```
+
+**Option B: Using HTTPS with Personal Access Token**
+```bash
+# On PythonAnywhere Bash console:
+cd ~
+# Clone specific branch (will prompt for username and token)
+git clone -b feature/remove-robocasa https://github.com/george-dvoryak/makeup_courses_bot.git makeup_courses_bot
+# Username: gosha.dvoryak@gmail.com
+# Password: <your-personal-access-token> (NOT your GitHub password!)
+cd makeup_courses_bot
+```
+
+**Note:** See [GITHUB_AUTHENTICATION.md](GITHUB_AUTHENTICATION.md) for detailed authentication setup.
 
 ### 2. Install Dependencies
 ```bash

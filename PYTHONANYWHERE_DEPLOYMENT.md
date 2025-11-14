@@ -13,20 +13,33 @@ Complete guide for deploying the Telegram bot to PythonAnywhere.
 
 ### Option A: Using Git (Recommended)
 
-1. **Push your code to GitHub/GitLab**:
-   ```bash
-   git init
-   git add .
-   git commit -m "Initial commit"
-   git remote add origin <your-repo-url>
-   git push -u origin main
-   ```
+1. **On PythonAnywhere**, open a Bash console and clone:
 
-2. **On PythonAnywhere**, open a Bash console and clone:
+   **Option A: Using SSH (Recommended - no authentication needed if SSH keys are set up)**
    ```bash
    cd ~
-   git clone <your-repo-url> makeup_courses_bot
+   # Clone specific branch using SSH
+   git clone -b feature/remove-robocasa git@github.com:george-dvoryak/makeup_courses_bot.git makeup_courses_bot
    cd makeup_courses_bot
+   ```
+   
+   **Option B: Using HTTPS with Personal Access Token**
+   ```bash
+   cd ~
+   # Clone specific branch (GitHub will prompt for username and token)
+   git clone -b feature/remove-robocasa https://github.com/george-dvoryak/makeup_courses_bot.git makeup_courses_bot
+   # When prompted:
+   # Username: gosha.dvoryak@gmail.com
+   # Password: <your-personal-access-token> (NOT your GitHub password!) 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
+   cd makeup_courses_bot
+   ```
+   
+   **Option C: Clone main branch and checkout**
+   ```bash
+   cd ~
+   git clone git@github.com:george-dvoryak/makeup_courses_bot.git makeup_courses_bot
+   cd makeup_courses_bot
+   git checkout feature/remove-robocasa  # Replace with your branch name
    ```
 
 ### Option B: Using Files Tab
