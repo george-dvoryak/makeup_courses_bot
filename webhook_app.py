@@ -157,6 +157,9 @@ if WEBHOOK_PATH:
             return f"Webhook endpoint active. Path: {WEBHOOK_PATH}", 200
         
         # POST request - handle Telegram webhook
+        # Log immediately to ensure we see requests
+        print(f"[{datetime.now()}] [Webhook] Received POST request", file=sys.stderr)
+        
         # Return OK immediately to Telegram (best practice)
         # Then process update asynchronously if needed
         
