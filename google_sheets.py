@@ -12,6 +12,18 @@ def fetch_sheet_csv(sheet_name: str):
     data = list(csv.reader(content.splitlines()))
     return data
 
+def parse_duration(value):
+    """
+    Parse duration value. Returns None if empty/0 (unlimited), otherwise returns int (days).
+    """
+    if not value or str(value).strip() == "" or str(value).strip() == "0":
+        return None  # Unlimited access
+    try:
+        duration = int(float(value))
+        return None if duration == 0 else duration
+    except (ValueError, TypeError):
+        return None  # Unlimited access if can't parse
+
 def get_courses_data():
     if GOOGLE_SHEETS_USE_API:
         try:
@@ -32,7 +44,7 @@ def get_courses_data():
                 "name": (rec.get("name") or rec.get("Name") or rec.get("Название") or "").strip(),
                 "description": (rec.get("description") or rec.get("Description") or rec.get("Описание") or "").strip(),
                 "price": float(rec.get("price") or rec.get("Price") or rec.get("Цена") or 0),
-                "duration_minutes": int(float(rec.get("duration_minutes") or rec.get("Duration") or rec.get("Срок") or 0)),
+                "duration_days": parse_duration(rec.get("duration_days") or rec.get("Duration") or rec.get("Срок") or rec.get("duration_minutes")),
                 "image_url": (rec.get("image_url") or rec.get("Image") or rec.get("Картинка") or "").strip(),
                 "channel": (rec.get("channel") or rec.get("Channel") or rec.get("Канал") or "").strip(),
             }
@@ -55,23 +67,21 @@ def get_courses_data():
             name = (d.get("name") or d.get("Name") or d.get("Название") or "").strip()
             desc = (d.get("description") or d.get("Description") or d.get("Описание") or "").strip()
             price = d.get("price") or d.get("Price") or d.get("Цена") or "0"
-            duration = d.get("duration_minutes") or d.get("Duration") or d.get("Срок") or "0"
+            duration = d.get("duration_days") or d.get("Duration") or d.get("Срок") or d.get("duration_minutes") or ""
             image = (d.get("image_url") or d.get("Image") or d.get("Картинка") or "").strip()
             channel = (d.get("channel") or d.get("Channel") or d.get("Канал") or "").strip()
             try:
                 price = float(str(price).replace(",", ".") if price else 0)
             except (ValueError, TypeError):
                 price = 0.0
-            try:
-                duration = int(float(duration)) if duration else 0
-            except (ValueError, TypeError):
-                duration = 0
+            # Если duration пустой или 0, то None (бессрочный доступ)
+            duration = parse_duration(duration)
             courses.append({
                 "id": course_id,
                 "name": name,
                 "description": desc,
                 "price": price,
-                "duration_minutes": duration,
+                "duration_days": duration,
                 "image_url": image,
                 "channel": channel
             })

@@ -23,6 +23,10 @@ bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=False)
 # Format: {user_id: {"course_id": course_id, "order_id": order_id, "price": price, "name": name}}
 prodamus_pending_emails = {}
 
+# In-memory state for admin broadcast
+# Format: {user_id: {"type": "all"/"buyers"/"nonbuyers", "text": "...", "photo": file_id or None}}
+admin_broadcast_state = {}
+
 # --- Webhook / WSGI (PythonAnywhere) support ---
 # Import webhook config from config.py (already processed and normalized)
 try:
@@ -191,7 +195,7 @@ def prodamus_result():
                     return "ERROR: Course not found", 404
                 
                 course_name = course.get("name", f"ID {course_id}")
-                duration = int(course.get("duration_minutes", 0))
+                duration = course.get("duration_days")  # None if unlimited, int if limited
                 channel = str(course.get("channel", ""))
                 
                 # Add purchase to database
@@ -601,7 +605,9 @@ def get_main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     if user_id in ADMIN_IDS:
         btn_admin_subs = types.KeyboardButton("📊 Все подписки")
         btn_admin_sheets = types.KeyboardButton("📋 Google Sheets")
+        btn_admin_broadcast = types.KeyboardButton("📢 Рассылка")
         keyboard.add(btn_admin_subs, btn_admin_sheets)
+        keyboard.add(btn_admin_broadcast)
     
     return keyboard
 
@@ -713,9 +719,13 @@ def handle_active(message: telebot.types.Message):
         clean_course_name = strip_html(course_name) if course_name else "Курс"
         channel_id = s["channel_id"]
         expiry_ts = s["expiry"]
-        dt = datetime.datetime.fromtimestamp(expiry_ts)
-        dstr = dt.strftime("%Y-%m-%d")
-        text += f"• {clean_course_name} (доступ до {dstr}) – "
+        # If expiry_ts is 0, subscription is unlimited
+        if expiry_ts == 0:
+            text += f"• {clean_course_name} (бессрочный доступ) – "
+        else:
+            dt = datetime.datetime.fromtimestamp(expiry_ts)
+            dstr = dt.strftime("%Y-%m-%d")
+            text += f"• {clean_course_name} (доступ до {dstr}) – "
         if str(channel_id).startswith("@"):
             text += f"{channel_id}\n"
         else:
@@ -886,9 +896,13 @@ def handle_admin_all_subscriptions(message: telebot.types.Message):
                 course_name = s["course_name"]
                 clean_course_name = strip_html(course_name) if course_name else "Курс"
                 expiry_ts = s["expiry"]
-                dt = datetime.datetime.fromtimestamp(expiry_ts)
-                dstr = dt.strftime("%Y-%m-%d %H:%M")
-                text += f"  • {clean_course_name} (до {dstr})\n"
+                # If expiry_ts is 0, subscription is unlimited
+                if expiry_ts == 0:
+                    text += f"  • {clean_course_name} (бессрочный доступ)\n"
+                else:
+                    dt = datetime.datetime.fromtimestamp(expiry_ts)
+                    dstr = dt.strftime("%Y-%m-%d %H:%M")
+                    text += f"  • {clean_course_name} (до {dstr})\n"
             text += "\n"
         
         # Split message if too long (Telegram limit is 4096 chars)
@@ -951,7 +965,7 @@ def cb_course(c: telebot.types.CallbackQuery):
     name = course.get("name", "")
     desc = course.get("description", "")
     price = course.get("price", 0)
-    duration = course.get("duration_minutes", 0)
+    duration = course.get("duration_days")  # None if unlimited, int if limited
     image_url = course.get("image_url", "")
     channel_id = course.get("channel", "")
 
@@ -988,7 +1002,12 @@ def cb_course(c: telebot.types.CallbackQuery):
 
     # Strip HTML from description too
     clean_desc = strip_html(desc) if desc else ""
-    text = f"{formatted_name}\n{clean_desc}\n\nЦена: {price} руб.\nДоступ: {duration} мин."
+    # Format duration: None/0 = unlimited, otherwise show days
+    if duration is None or duration == 0:
+        duration_text = "бессрочно"
+    else:
+        duration_text = f"{duration} дн." if duration == 1 else f"{duration} дн."
+    text = f"{formatted_name}\n{clean_desc}\n\nЦена: {price} руб.\nДоступ: {duration_text}"
     ikb = types.InlineKeyboardMarkup()
     # Add payment buttons
     if ENABLE_PRODAMUS and PRODAMUS_SECRET_KEY:
@@ -1389,7 +1408,7 @@ def handle_successful_payment(message: telebot.types.Message):
         courses = []
     course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
     course_name = course.get("name", f"ID {course_id}") if course else f"ID {course_id}"
-    duration = int(course.get("duration_minutes", 0)) if course else 0
+    duration = course.get("duration_days") if course else None  # None if unlimited
     channel = str(course.get("channel", "")) if course else ""
 
     expiry_ts = add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=payment.telegram_payment_charge_id)
@@ -1576,6 +1595,240 @@ def handle_broadcast(message: telebot.types.Message):
     if failed > 0:
         reply_msg += f" Не удалось отправить: {failed}."
     bot.reply_to(message, reply_msg)
+
+def send_broadcast_messages(recipients: list, text: str, photo_file_id: str = None):
+    """
+    Send broadcast messages to recipients.
+    Returns tuple (sent_count, failed_count)
+    """
+    sent = 0
+    failed = 0
+    
+    for uid in recipients:
+        try:
+            if photo_file_id:
+                # Send photo with caption
+                bot.send_photo(uid, photo_file_id, caption=text, disable_web_page_preview=True)
+            else:
+                # Send text only
+                bot.send_message(uid, text, disable_web_page_preview=True)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            # Log first few failures for debugging
+            if failed <= 3:
+                print(f"Failed to send broadcast to user {uid}: {e}")
+    
+    return sent, failed
+
+# Admin broadcast handler - button in menu
+@bot.message_handler(func=lambda m: m.text == "📢 Рассылка" and m.from_user.id in ADMIN_IDS)
+def handle_broadcast_button(message: telebot.types.Message):
+    """Show broadcast type selection"""
+    user_id = message.from_user.id
+    
+    # Reset broadcast state
+    admin_broadcast_state[user_id] = {"type": None, "text": None, "photo": None}
+    
+    text = "📢 Выберите тип рассылки:"
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("👥 Всем пользователям", callback_data="broadcast_type_all"))
+    kb.add(types.InlineKeyboardButton("💰 Покупателям", callback_data="broadcast_type_buyers"))
+    kb.add(types.InlineKeyboardButton("🆕 Непокупателям", callback_data="broadcast_type_nonbuyers"))
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel"))
+    
+    bot.send_message(user_id, text, reply_markup=kb)
+
+# Broadcast type selection callback
+@bot.callback_query_handler(func=lambda c: c.data.startswith("broadcast_type_"))
+def cb_broadcast_type(c: telebot.types.CallbackQuery):
+    user_id = c.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.answer_callback_query(c.id, "У вас нет доступа.")
+        return
+    
+    broadcast_type = c.data.split("_")[-1]  # all, buyers, nonbuyers
+    
+    # Initialize broadcast state
+    if user_id not in admin_broadcast_state:
+        admin_broadcast_state[user_id] = {}
+    admin_broadcast_state[user_id]["type"] = broadcast_type
+    
+    type_names = {
+        "all": "всем пользователям",
+        "buyers": "покупателям",
+        "nonbuyers": "непокупателям"
+    }
+    
+    text = f"📢 Рассылка {type_names.get(broadcast_type, '')}\n\n"
+    text += "Отправьте текст сообщения. Вы также можете прикрепить фото."
+    
+    kb = types.InlineKeyboardMarkup()
+    kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel"))
+    
+    bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=kb)
+    bot.answer_callback_query(c.id)
+
+# Cancel broadcast
+@bot.callback_query_handler(func=lambda c: c.data == "broadcast_cancel")
+def cb_broadcast_cancel(c: telebot.types.CallbackQuery):
+    user_id = c.from_user.id
+    if user_id in admin_broadcast_state:
+        del admin_broadcast_state[user_id]
+    
+    bot.edit_message_text("❌ Рассылка отменена.", chat_id=c.message.chat.id, message_id=c.message.message_id)
+    bot.answer_callback_query(c.id)
+
+# Handle text message for broadcast
+# This handler must be before other text handlers to catch broadcast text
+@bot.message_handler(func=lambda m: m.from_user.id in admin_broadcast_state and m.from_user.id in ADMIN_IDS and m.text and not m.text.startswith("/") and m.text not in ["Каталог", "Активные подписки", "Поддержка", "Оферта", "📊 Все подписки", "📋 Google Sheets", "📢 Рассылка"])
+def handle_broadcast_text(message: telebot.types.Message):
+    """Handle text input for broadcast"""
+    user_id = message.from_user.id
+    
+    if user_id not in admin_broadcast_state:
+        return
+    
+    state = admin_broadcast_state[user_id]
+    
+    if state.get("type") is None:
+        return
+    
+    # Save text
+    state["text"] = message.text
+    
+    # If photo already set, send immediately
+    if state.get("photo"):
+        execute_broadcast(user_id, state)
+    else:
+        # Ask if want to add photo or send now
+        text = f"📝 Текст сохранен:\n\n{message.text[:200]}{'...' if len(message.text) > 200 else ''}\n\n"
+        text += "Вы можете прикрепить фото или отправить рассылку сейчас."
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("📷 Прикрепить фото", callback_data="broadcast_add_photo"))
+        kb.add(types.InlineKeyboardButton("✅ Отправить сейчас", callback_data="broadcast_send"))
+        kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel"))
+        
+        bot.send_message(user_id, text, reply_markup=kb)
+
+# Handle photo for broadcast
+@bot.message_handler(func=lambda m: m.from_user.id in admin_broadcast_state and m.from_user.id in ADMIN_IDS and m.photo, content_types=['photo'])
+def handle_broadcast_photo(message: telebot.types.Message):
+    """Handle photo input for broadcast"""
+    user_id = message.from_user.id
+    
+    if user_id not in admin_broadcast_state:
+        return
+    
+    state = admin_broadcast_state[user_id]
+    
+    if state.get("type") is None:
+        return
+    
+    # Get largest photo
+    photo = message.photo[-1]
+    state["photo"] = photo.file_id
+    
+    # If text already set, ask to send
+    if state.get("text"):
+        text = f"📷 Фото прикреплено\n📝 Текст: {state['text'][:200]}{'...' if len(state['text']) > 200 else ''}\n\n"
+        text += "Готово к отправке!"
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("✅ Отправить рассылку", callback_data="broadcast_send"))
+        kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel"))
+        
+        bot.send_message(user_id, text, reply_markup=kb)
+    else:
+        bot.send_message(user_id, "📷 Фото сохранено. Теперь отправьте текст сообщения.")
+
+# Send broadcast callback
+@bot.callback_query_handler(func=lambda c: c.data == "broadcast_send")
+def cb_broadcast_send(c: telebot.types.CallbackQuery):
+    user_id = c.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.answer_callback_query(c.id, "У вас нет доступа.")
+        return
+    
+    if user_id not in admin_broadcast_state:
+        bot.answer_callback_query(c.id, "Ошибка: состояние рассылки не найдено.")
+        return
+    
+    state = admin_broadcast_state[user_id]
+    
+    if not state.get("text"):
+        bot.answer_callback_query(c.id, "Ошибка: текст сообщения не указан.")
+        return
+    
+    execute_broadcast(user_id, state)
+    bot.answer_callback_query(c.id)
+
+# Add photo callback
+@bot.callback_query_handler(func=lambda c: c.data == "broadcast_add_photo")
+def cb_broadcast_add_photo(c: telebot.types.CallbackQuery):
+    user_id = c.from_user.id
+    bot.edit_message_text("📷 Отправьте фото для рассылки.", chat_id=c.message.chat.id, message_id=c.message.message_id)
+    bot.answer_callback_query(c.id)
+
+def execute_broadcast(user_id: int, state: dict):
+    """Execute broadcast with given state"""
+    broadcast_type = state.get("type")
+    text = state.get("text")
+    photo = state.get("photo")
+    
+    if not broadcast_type or not text:
+        bot.send_message(user_id, "❌ Ошибка: не указан тип рассылки или текст.")
+        return
+    
+    # Get recipients
+    recipients = []
+    try:
+        conn = sqlite3.connect(DATABASE_PATH)
+        cur = conn.cursor()
+        if broadcast_type == "all":
+            cur.execute("SELECT user_id FROM users;")
+        elif broadcast_type == "buyers":
+            cur.execute("SELECT DISTINCT user_id FROM purchases;")
+        elif broadcast_type == "nonbuyers":
+            cur.execute("SELECT user_id FROM users WHERE user_id NOT IN (SELECT DISTINCT user_id FROM purchases);")
+        rows = cur.fetchall()
+        recipients = [r[0] for r in rows]
+        conn.close()
+    except Exception as e:
+        print(f"Broadcast database error: {e}")
+        bot.send_message(user_id, f"❌ Ошибка при получении списка получателей: {e}")
+        return
+    
+    if not recipients:
+        bot.send_message(user_id, "❌ Получатели не найдены.")
+        # Clear state
+        if user_id in admin_broadcast_state:
+            del admin_broadcast_state[user_id]
+        return
+    
+    # Send progress message
+    type_names = {
+        "all": "всем пользователям",
+        "buyers": "покупателям",
+        "nonbuyers": "непокупателям"
+    }
+    progress_msg = bot.send_message(user_id, f"📤 Отправка рассылки {type_names.get(broadcast_type, '')}...\nПолучателей: {len(recipients)}")
+    
+    # Send messages
+    sent, failed = send_broadcast_messages(recipients, text, photo)
+    
+    # Show statistics
+    stats_text = f"📊 Статистика рассылки:\n\n"
+    stats_text += f"✅ Отправлено: {sent}\n"
+    stats_text += f"❌ Не удалось отправить: {failed}\n"
+    stats_text += f"📊 Всего получателей: {len(recipients)}"
+    
+    bot.edit_message_text(stats_text, chat_id=progress_msg.chat.id, message_id=progress_msg.message_id)
+    
+    # Clear state
+    if user_id in admin_broadcast_state:
+        del admin_broadcast_state[user_id]
 
 
 def remove_user_from_channel(user_id: int, channel_id: str):

@@ -21,7 +21,7 @@
 
 ## Google Sheets
 Два листа: **Courses** и **Texts**.
-- Courses: `id, name, description, price, duration_minutes, image_url, channel`
+- Courses: `id, name, description, price, duration_days, image_url, channel` (если `duration_days` пустое или 0, доступ бессрочный)
 - Texts: `key, value` (например: `welcome_message`, `support_message`, `catalog_title`, `welcome_image_url`, `catalog_image_url`, `catalog_text`)
 
 Для простоты используйте публикацию листов как CSV:     File → Publish to the web → выбрать лист → получить CSV. Установите `GSHEET_ID` и имена листов в `.env` файле.

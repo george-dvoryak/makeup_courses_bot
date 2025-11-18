@@ -31,7 +31,8 @@ Complete guide for deploying the Telegram bot to PythonAnywhere.
    # When prompted:
    # Username: gosha.dvoryak@gmail.com
    # Password: <your-personal-access-token> (NOT your GitHub password!) 
-   # ывыв
+   # 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
+   # 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
    cd makeup_courses_bot
    ```
    

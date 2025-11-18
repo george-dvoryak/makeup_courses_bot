@@ -56,11 +56,19 @@ def get_user(user_id: int):
     cur.execute("SELECT * FROM users WHERE user_id = ?;", (user_id,))
     return cur.fetchone()
 
-def add_purchase(user_id: int, course_id: str, course_name: str, channel_id: str, duration_minutes: int, payment_id: str = None):
+def add_purchase(user_id: int, course_id: str, course_name: str, channel_id: str, duration_days: int = None, payment_id: str = None):
+    """
+    Add a purchase. If duration_days is None or 0, subscription is unlimited (expiry = 0).
+    duration_days: number of days, or None/0 for unlimited access
+    """
     conn = get_connection()
     cur = conn.cursor()
     now = int(time.time())
-    expiry_ts = now + int(duration_minutes) * 60
+    # If duration_days is None, 0, or empty, set expiry to 0 (unlimited access)
+    if duration_days is None or duration_days == 0:
+        expiry_ts = 0  # 0 means unlimited access
+    else:
+        expiry_ts = now + int(duration_days) * 24 * 60 * 60  # Convert days to seconds
     cur.execute(
         """
         INSERT INTO purchases (user_id, course_id, course_name, channel_id, expiry, payment_id)
@@ -72,25 +80,31 @@ def add_purchase(user_id: int, course_id: str, course_name: str, channel_id: str
     return expiry_ts
 
 def get_active_subscriptions(user_id: int):
+    """
+    Get active subscriptions. expiry = 0 means unlimited access (always active).
+    """
     conn = get_connection()
     cur = conn.cursor()
     now = int(time.time())
     cur.execute(
         """
         SELECT course_name, channel_id, expiry FROM purchases
-        WHERE user_id = ? AND expiry > ?;
+        WHERE user_id = ? AND (expiry = 0 OR expiry > ?);
         """,
         (user_id, now)
     )
     return cur.fetchall()
 
 def has_active_subscription(user_id: int, course_id: str):
+    """
+    Check if user has active subscription. expiry = 0 means unlimited access (always active).
+    """
     conn = get_connection()
     cur = conn.cursor()
     now = int(time.time())
     cur.execute(
         """
-        SELECT 1 FROM purchases WHERE user_id = ? AND course_id = ? AND expiry > ?;
+        SELECT 1 FROM purchases WHERE user_id = ? AND course_id = ? AND (expiry = 0 OR expiry > ?);
         """,
         (user_id, course_id, now)
     )
@@ -116,6 +130,7 @@ def get_expired_subscriptions():
     """
     Get subscriptions that have expired but haven't been processed yet.
     Only returns subscriptions where expiry > 0 (not yet marked as processed).
+    Excludes unlimited subscriptions (expiry = 0).
     """
     conn = get_connection()
     cur = conn.cursor()
@@ -132,7 +147,10 @@ def get_expired_subscriptions():
     return cur.fetchall()
 
 def get_all_active_subscriptions():
-    """Get all active subscriptions for all users (admin function)"""
+    """
+    Get all active subscriptions for all users (admin function).
+    Includes unlimited subscriptions (expiry = 0).
+    """
     conn = get_connection()
     cur = conn.cursor()
     now = int(time.time())
@@ -140,7 +158,7 @@ def get_all_active_subscriptions():
         """
         SELECT user_id, course_id, course_name, channel_id, expiry
         FROM purchases
-        WHERE expiry > ?
+        WHERE expiry = 0 OR expiry > ?
         ORDER BY expiry DESC;
         """,
         (now,)
