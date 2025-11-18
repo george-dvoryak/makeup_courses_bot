@@ -26,31 +26,23 @@ if not PAYMENT_PROVIDER_TOKEN:
     raise ValueError("PAYMENT_PROVIDER_TOKEN is required. Please set it in .env file")
 CURRENCY = os.getenv("CURRENCY", "RUB")
 
-# === Offer details ===
-# Optional details to include in the offer message
-OFFER_INN = os.getenv("OFFER_INN", "771618630441")
-OFFER_FULL_NAME = os.getenv("OFFER_FULL_NAME", "Дворяк Георгий Алексеевич")
-
-# === PAYMENTS (Robokassa via Telegram Payments) ===
-# Feature flag to show Robokassa buttons/flows in the bot UI
-ENABLE_ROBOKASSA = get_bool_env("ENABLE_ROBOKASSA", False)
-# BotFather provider token for Robokassa
-# For TEST environment: Get test token from BotFather after connecting Robokassa test shop
-# For PRODUCTION: Get production token from BotFather after connecting Robokassa production shop
-# Format: "MerchantLogin:TEST:Password" (test) or "MerchantLogin:LIVE:Password" (production)
-ROBOKASSA_PROVIDER_TOKEN = os.getenv("ROBOKASSA_PROVIDER_TOKEN", "")
+# === PAYMENTS (Prodamus direct integration) ===
+# Feature flag to show Prodamus buttons/flows in the bot UI
+ENABLE_PRODAMUS = get_bool_env("ENABLE_PRODAMUS", True)
 # Test mode flag (use test environment for development/testing)
 # Set to "True" to use test environment, "False" for production
-RBK_TEST_MODE = get_bool_env("RBK_TEST_MODE", True)
-# Receipt defaults tuned for self-employed (НПД). Adjust if ваш кейс требует иного:
-#   sno: one of ["osn","usn_income","usn_income_outcome","envd","esn","patent"]
-#   tax: 'none' for НПД (без НДС), or 'vat0', 'vat10', 'vat20', 'vat110', 'vat120'
-#   payment_object: typically 'service' for онлайн-курсов
-#   payment_method: usually 'full_payment'
-RBK_SNO = os.getenv("RBK_SNO", "usn_income")
-RBK_TAX = os.getenv("RBK_TAX", "none")
-RBK_PAYMENT_OBJECT = os.getenv("RBK_PAYMENT_OBJECT", "service")
-RBK_PAYMENT_METHOD = os.getenv("RBK_PAYMENT_METHOD", "full_payment")
+PRODAMUS_TEST_MODE = get_bool_env("PRODAMUS_TEST_MODE", True)
+# Payment form URL (test or production)
+# Test: testwork1.payform.ru
+# Production: your production payform domain
+PRODAMUS_PAYFORM_URL = os.getenv("PRODAMUS_PAYFORM_URL", "testwork1.payform.ru")
+# Secret key for webhook verification (from Prodamus dashboard)
+PRODAMUS_SECRET_KEY = os.getenv("PRODAMUS_SECRET_KEY", "")
+# System ID (if required by Prodamus API)
+PRODAMUS_SYSTEM_ID = os.getenv("PRODAMUS_SYSTEM_ID", "")
+# Test webhook URL for debugging (e.g., webhook.site URL)
+# If set, all webhook data will also be forwarded to this URL for testing
+PRODAMUS_TEST_WEBHOOK_URL = os.getenv("PRODAMUS_TEST_WEBHOOK_URL", "")
 
 # === SQLite DB ===
 DATABASE_PATH = os.getenv("DATABASE_PATH", "bot.db")

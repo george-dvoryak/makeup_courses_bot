@@ -7,14 +7,21 @@ from telebot import types
 import os
 import time
 import re
+import hashlib
+from urllib.parse import urlencode, quote
 from flask import Flask, request, abort
+import requests
 
-from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, OFFER_INN, OFFER_FULL_NAME
+from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, ENABLE_PRODAMUS, PRODAMUS_PAYFORM_URL, PRODAMUS_SECRET_KEY, PRODAMUS_TEST_MODE, PRODAMUS_SYSTEM_ID, PRODAMUS_TEST_WEBHOOK_URL
 from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions
 from google_sheets import get_courses_data, get_texts_data
 
 
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=False)
+
+# In-memory state for Prodamus email collection
+# Format: {user_id: {"course_id": course_id, "order_id": order_id, "price": price, "name": name}}
+prodamus_pending_emails = {}
 
 # --- Webhook / WSGI (PythonAnywhere) support ---
 # Import webhook config from config.py (already processed and normalized)
@@ -63,6 +70,228 @@ def _diag():
         report = f"diag error: {e}"
     return report, 200
 
+# Helper function to forward webhook data to test URL
+def forward_to_test_webhook(endpoint_name: str, data: dict, method: str = "GET"):
+    """Forward webhook data to test webhook URL (e.g., webhook.site) for debugging"""
+    if not PRODAMUS_TEST_WEBHOOK_URL:
+        return
+    
+    try:
+        test_data = {
+            "endpoint": endpoint_name,
+            "method": method,
+            "data": data,
+            "timestamp": time.time()
+        }
+        requests.post(PRODAMUS_TEST_WEBHOOK_URL, json=test_data, timeout=5)
+        print(f"[Prodamus Test] Forwarded {endpoint_name} data to test webhook")
+    except Exception as e:
+        print(f"[Prodamus Test] Failed to forward to test webhook: {e}")
+
+# Prodamus webhook handlers (Success/Fail/Result URLs)
+@application.route("/prodamus/result", methods=["GET", "POST"])
+def prodamus_result():
+    """
+    Handle Prodamus Result URL notification (payment status update)
+    This endpoint receives payment notifications from Prodamus
+    Must return "OK" if payment is valid, or error code otherwise
+    """
+    try:
+        # Get request data (can be GET or POST)
+        if request.method == "GET":
+            data = request.args.to_dict()
+        else:
+            data = request.form.to_dict() if request.form else request.get_json() or {}
+        
+        # For POST requests, check signature in header (Prodamus sends it as 'sign' header)
+        if request.method == "POST" and "sign" in request.headers:
+            data["signature"] = request.headers.get("sign", "")
+        
+        # Log the notification for debugging
+        print(f"[Prodamus Result] Received notification: {data}")
+        print(f"[Prodamus Result] Request headers: {dict(request.headers)}")
+        
+        # Forward to test webhook if configured
+        forward_to_test_webhook("result", data, request.method)
+        
+        # Verify signature if secret key is configured
+        if PRODAMUS_SECRET_KEY:
+            if not verify_prodamus_signature(data, PRODAMUS_SECRET_KEY):
+                print(f"[Prodamus Result] Invalid signature")
+                return "ERROR: Invalid signature", 400
+        
+        # Extract required parameters
+        # Prodamus may send order_id, order, or order_num parameter
+        # order_num is used in Result URL POST requests
+        order_number = data.get("order_num", "") or data.get("order_id", "") or data.get("order", "")
+        amount = data.get("sum", "") or data.get("amount", "")
+        # Prodamus may send status or payment_status
+        payment_status = (data.get("payment_status", "") or data.get("status", "")).lower()
+        
+        if not order_number or not amount:
+            print(f"[Prodamus Result] Missing required parameters. Received data: {data}")
+            return "ERROR: Missing parameters", 400
+        
+        # Only process successful payments
+        if payment_status not in ("success", "paid", "successful"):
+            print(f"[Prodamus Result] Payment not successful, status: {payment_status}")
+            return "OK", 200  # Still return OK to acknowledge receipt
+        
+        # Find pending payment in database
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            # Create pending_payments table if not exists
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_payments (
+                    invoice_id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    course_id TEXT,
+                    amount REAL,
+                    created_at INTEGER,
+                    payment_system TEXT,
+                    order_id TEXT
+                )
+            """)
+            # Add columns if they don't exist (migration)
+            try:
+                cur.execute("ALTER TABLE pending_payments ADD COLUMN payment_system TEXT")
+            except sqlite3.OperationalError:
+                # Column already exists, ignore
+                pass
+            try:
+                cur.execute("ALTER TABLE pending_payments ADD COLUMN order_id TEXT")
+            except sqlite3.OperationalError:
+                # Column already exists, ignore
+                pass
+            # Try to find by order_id or invoice_id
+            cur.execute("SELECT user_id, course_id, amount FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
+            row = cur.fetchone()
+            
+            if not row:
+                print(f"[Prodamus Result] Payment not found for order/invoice {order_number}")
+                conn.close()
+                return "ERROR: Payment not found", 404
+            
+            user_id, course_id, expected_amount = row[0], row[1], row[2]
+            
+            # Verify amount matches
+            if abs(float(amount) - float(expected_amount)) > 0.01:  # Allow small floating point differences
+                print(f"[Prodamus Result] Amount mismatch for order {order_number}: expected {expected_amount}, got {amount}")
+                conn.close()
+                return "ERROR: Amount mismatch", 400
+            
+            # Get course data
+            try:
+                courses = get_courses_data()
+                course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
+                if not course:
+                    print(f"[Prodamus Result] Course {course_id} not found")
+                    conn.close()
+                    return "ERROR: Course not found", 404
+                
+                course_name = course.get("name", f"ID {course_id}")
+                duration = int(course.get("duration_minutes", 0))
+                channel = str(course.get("channel", ""))
+                
+                # Add purchase to database
+                expiry_ts = add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"prodamus_{order_number}")
+                
+                # Remove from pending payments (use order_id to match storage pattern)
+                cur.execute("DELETE FROM pending_payments WHERE order_id = ?", (order_number,))
+                conn.commit()
+                conn.close()
+                
+                # Send success message to user
+                clean_course_name = strip_html(course_name) if course_name else f"ID {course_id}"
+                text = f"✅ Оплата успешно получена!\n\n"
+                text += f"Вам предоставлен доступ к курсу: {clean_course_name}"
+                
+                # Create invite link if channel exists
+                invite_link = None
+                if channel:
+                    try:
+                        invite = bot.create_chat_invite_link(chat_id=channel, member_limit=1, expire_date=None)
+                        invite_link = invite.invite_link
+                    except Exception as e:
+                        print(f"create_chat_invite_link failed for {channel}: {e}")
+                
+                if invite_link:
+                    text += "\n\nНажмите кнопку ниже, чтобы перейти к материалам курса."
+                    kb = types.InlineKeyboardMarkup()
+                    kb.add(types.InlineKeyboardButton("Перейти в канал курса", url=invite_link))
+                    bot.send_message(user_id, text, reply_markup=kb)
+                else:
+                    bot.send_message(user_id, text)
+                
+                # Notify admins
+                admin_text = f"💰 Оплата Prodamus: пользователь {user_id} купил {clean_course_name} на сумму {amount} руб. (Order: {order_number})"
+                for aid in ADMIN_IDS:
+                    try:
+                        bot.send_message(aid, admin_text)
+                    except Exception:
+                        pass
+                
+                print(f"[Prodamus Result] Successfully processed payment for order {order_number}")
+                return "OK", 200
+                
+            except Exception as e:
+                print(f"[Prodamus Result] Error processing payment: {e}")
+                conn.close()
+                return "ERROR: Processing error", 500
+                
+        except Exception as e:
+            print(f"[Prodamus Result] Database error: {e}")
+            return "ERROR: Database error", 500
+        
+    except Exception as e:
+        print(f"[Prodamus Result] Error: {e}")
+        return "ERROR", 500
+
+@application.route("/prodamus/success", methods=["GET", "POST"])
+def prodamus_success():
+    """
+    Handle Prodamus Success URL (user redirected after successful payment)
+    """
+    try:
+        if request.method == "GET":
+            data = request.args.to_dict()
+        else:
+            data = request.form.to_dict() if request.form else request.get_json() or {}
+        
+        print(f"[Prodamus Success] User redirected: {data}")
+        
+        # Forward to test webhook if configured
+        forward_to_test_webhook("success", data, request.method)
+        
+        # Return a simple success page or redirect
+        return "Payment successful! You can close this page.", 200
+    except Exception as e:
+        print(f"[Prodamus Success] Error: {e}")
+        return "ERROR", 500
+
+@application.route("/prodamus/fail", methods=["GET", "POST"])
+def prodamus_fail():
+    """
+    Handle Prodamus Fail URL (user redirected after failed payment)
+    """
+    try:
+        if request.method == "GET":
+            data = request.args.to_dict()
+        else:
+            data = request.form.to_dict() if request.form else request.get_json() or {}
+        
+        print(f"[Prodamus Fail] User redirected: {data}")
+        
+        # Forward to test webhook if configured
+        forward_to_test_webhook("fail", data, request.method)
+        
+        # Return a simple failure page or redirect
+        return "Payment failed. Please try again.", 200
+    except Exception as e:
+        print(f"[Prodamus Fail] Error: {e}")
+        return "ERROR", 500
+
 # Configure Telegram webhook at import time when running under WSGI
 if USE_WEBHOOK and WEBHOOK_URL and not WEBHOOK_URL.startswith("https://<"):
     try:
@@ -101,7 +330,243 @@ def clean_html_text(text: str) -> str:
     text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
     return text.strip()
 
-# (Robokassa helper removed)
+# Prodamus payment integration
+def generate_prodamus_signature(data: dict, secret_key: str) -> str:
+    """
+    Generate Prodamus webhook signature.
+    Format: MD5 hash of sorted key-value pairs + secret key
+    According to Prodamus docs: sort all parameters except 'sign'/'signature', join with &, add secret key, calculate MD5
+    """
+    # Sort keys alphabetically, exclude signature-related keys
+    sorted_keys = sorted([k for k in data.keys() if k not in ('signature', 'sign')])
+    # Build signature string
+    signature_string = '&'.join([f"{k}={data[k]}" for k in sorted_keys])
+    signature_string += f"&{secret_key}"
+    # Calculate MD5 hash
+    return hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+
+def verify_prodamus_signature(data: dict, secret_key: str) -> bool:
+    """
+    Verify Prodamus webhook signature.
+    Prodamus may send signature as 'sign' (in header) or 'signature' (in body)
+    """
+    # Check for signature in data (can be 'sign' or 'signature')
+    received_signature = data.get('signature', '') or data.get('sign', '')
+    if not received_signature:
+        print(f"[Prodamus] No signature found in data")
+        return False
+    
+    received_signature = received_signature.lower()
+    calculated_signature = generate_prodamus_signature(data, secret_key).lower()
+    
+    if PRODAMUS_TEST_MODE:
+        print(f"[Prodamus] Signature verification: received={received_signature[:20]}..., calculated={calculated_signature[:20]}...")
+    
+    return received_signature == calculated_signature
+
+def create_prodamus_invoice(order_id: str, amount: float, product_name: str = "", customer_email: str = "", customer_phone: str = "") -> str:
+    """
+    Create Prodamus invoice via API and get invoice_id.
+    Returns invoice_id if successful, None otherwise.
+    
+    Documentation: 
+    - https://help.prodamus.ru/payform/integracii/rest-api/instrukcii-dlya-samostoyatelnaya-integracii-servisov
+    - https://help.prodamus.ru/payform/priyom-oplaty/kak-sozdat-personalnuyu-platyozhnuyu-ssylku
+    """
+    try:
+        # Build API URL
+        if PRODAMUS_TEST_MODE:
+            api_url = f"https://{PRODAMUS_PAYFORM_URL}/"
+        else:
+            api_url = f"https://{PRODAMUS_PAYFORM_URL}/"
+        
+        # Prepare request data according to Prodamus API
+        # For personal payment link, we need: products, order_id, customerEmail or customerPhone
+        data = {
+            "do": "link",  # Create invoice and get link
+            "products[0][name]": product_name[:255] if product_name else "Доступ к курсу",
+            "products[0][price]": str(float(amount)),
+            "products[0][quantity]": "1",
+            "order_id": order_id,
+        }
+        
+        # Add system ID if configured
+        if PRODAMUS_SYSTEM_ID:
+            data["sys"] = PRODAMUS_SYSTEM_ID
+        
+        # For personal link, at least one contact is required
+        if customer_email:
+            data["customerEmail"] = customer_email
+        
+        if customer_phone:
+            data["customerPhone"] = customer_phone
+        
+        # If no contact info, use a placeholder (some setups may require this)
+        if not customer_email and not customer_phone:
+            data["customerEmail"] = "customer@example.com"  # Placeholder
+        
+        if PRODAMUS_TEST_MODE:
+            print(f"[Prodamus] Creating invoice with data: {data}")
+            print(f"[Prodamus] Request URL: {api_url}")
+        
+        # Try GET request first (most common for payment forms)
+        response = None
+        try:
+            response = requests.get(api_url, params=data, allow_redirects=True, timeout=15)
+            if PRODAMUS_TEST_MODE:
+                print(f"[Prodamus] GET request successful, status: {response.status_code}")
+        except Exception as e:
+            if PRODAMUS_TEST_MODE:
+                print(f"[Prodamus] GET request failed: {e}, trying POST")
+            # Fallback to POST
+            try:
+                response = requests.post(api_url, data=data, allow_redirects=True, timeout=15)
+                if PRODAMUS_TEST_MODE:
+                    print(f"[Prodamus] POST request successful, status: {response.status_code}")
+            except Exception as e2:
+                print(f"[Prodamus] Both GET and POST failed: {e2}")
+                return None
+        
+        if not response:
+            return None
+        
+        # Get final URL after redirects
+        final_url = response.url
+        
+        # Try to extract from response text first (Prodamus returns short link in response text)
+        response_text = response.text.strip()
+        if PRODAMUS_TEST_MODE:
+            print(f"[Prodamus] Final URL after redirects: {final_url}")
+            print(f"[Prodamus] Response text (first 1000 chars): {response_text[:1000]}")
+        
+        # Prodamus may return short link like "https://payform.ru/5h9NArs/" in response text
+        # Extract the short code (invoice_id) from this link
+        if response_text.startswith("http"):
+            # Response is a URL - extract invoice_id from it
+            # Format: https://payform.ru/5h9NArs/ or https://testwork1.payform.ru/?invoice_id=xxx
+            if "invoice_id=" in response_text:
+                invoice_id = response_text.split("invoice_id=")[1].split("&")[0].split("?")[0].split("#")[0].split("/")[0]
+                if invoice_id and len(invoice_id) > 10:
+                    if PRODAMUS_TEST_MODE:
+                        print(f"[Prodamus] Extracted invoice_id from response URL: {invoice_id}")
+                    return invoice_id
+            # Try to extract short code from URL path
+            # Format: https://payform.ru/5h9NArs/ -> invoice_id = 5h9NArs
+            import re
+            match = re.search(r'payform\.ru/([a-zA-Z0-9]+)', response_text)
+            if match:
+                invoice_id = match.group(1)
+                if len(invoice_id) >= 6:  # Short codes are usually 6+ characters
+                    if PRODAMUS_TEST_MODE:
+                        print(f"[Prodamus] Extracted invoice_id from short link: {invoice_id}")
+                    return invoice_id
+        
+        # Extract invoice_id from final URL
+        if "invoice_id=" in final_url:
+            invoice_id = final_url.split("invoice_id=")[1].split("&")[0].split("?")[0].split("#")[0]
+            if invoice_id and len(invoice_id) > 10:  # Basic validation
+                if PRODAMUS_TEST_MODE:
+                    print(f"[Prodamus] Extracted invoice_id from final URL: {invoice_id}")
+                return invoice_id
+        
+        # Look for invoice_id in various formats
+        import re
+        patterns = [
+            r'invoice_id[=:](\w{20,})',  # invoice_id=xxx or invoice_id:xxx
+            r'invoice_id["\']?\s*[:=]\s*["\']?(\w{20,})',  # invoice_id: "xxx"
+            r'<input[^>]*name=["\']invoice_id["\'][^>]*value=["\'](\w{20,})',  # HTML input
+            r'data-invoice-id=["\'](\w{20,})',  # data attribute
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, response_text, re.IGNORECASE)
+            if match:
+                invoice_id = match.group(1)
+                if len(invoice_id) > 10:
+                    if PRODAMUS_TEST_MODE:
+                        print(f"[Prodamus] Extracted invoice_id using pattern {pattern}: {invoice_id}")
+                    return invoice_id
+        
+        # Try JSON response
+        try:
+            if response.headers.get("content-type", "").startswith("application/json"):
+                response_data = response.json()
+                if PRODAMUS_TEST_MODE:
+                    print(f"[Prodamus] JSON response: {response_data}")
+                if "invoice_id" in response_data:
+                    return str(response_data["invoice_id"])
+                if "link" in response_data:
+                    link = str(response_data["link"])
+                    if "invoice_id=" in link:
+                        invoice_id = link.split("invoice_id=")[1].split("&")[0].split("?")[0]
+                        return invoice_id
+        except:
+            pass
+        
+        if PRODAMUS_TEST_MODE:
+            print(f"[Prodamus] Could not extract invoice_id. Final URL: {final_url}")
+            print(f"[Prodamus] Response status: {response.status_code}")
+        
+        return None
+        
+    except Exception as e:
+        print(f"[Prodamus] Error creating invoice: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def generate_prodamus_payment_url(order_number: str, amount: float, product_name: str = "", customer_email: str = "", customer_phone: str = "") -> str:
+    """
+    Generate Prodamus payment URL with all parameters.
+    
+    Documentation: https://help.prodamus.ru/payform/integracii/rest-api/instrukcii-dlya-samostoyatelnaya-integracii-servisov
+    
+    Args:
+        order_number: Unique order number (used in webhook)
+        amount: Payment amount in rubles
+        product_name: Product name (required)
+        customer_email: Customer email (optional, but recommended for pre-filling form)
+        customer_phone: Customer phone (optional)
+    
+    Returns:
+        Payment URL string
+    """
+    # Build base URL
+    if PRODAMUS_TEST_MODE:
+        base_url = f"https://{PRODAMUS_PAYFORM_URL}/?old_auth=1"
+    else:
+        base_url = f"https://{PRODAMUS_PAYFORM_URL}/"
+    
+    params = {
+        "do": "pay",
+        "products[0][name]": product_name[:255] if product_name else "Доступ к курсу",
+        "products[0][price]": str(float(amount)),
+        "products[0][quantity]": "1",
+        "order_id": order_number,
+        "order": order_number,
+    }
+    
+    if PRODAMUS_SYSTEM_ID:
+        params["sys"] = PRODAMUS_SYSTEM_ID
+    
+    if customer_email:
+        # Try multiple parameter names for email pre-filling
+        # Prodamus may use different parameter names in different setups
+        params["email"] = customer_email  # Simple parameter name
+        params["customerEmail"] = customer_email  # CamelCase variant
+        params["customer_email"] = customer_email  # Snake_case variant
+    
+    if customer_phone:
+        params["customerPhone"] = customer_phone
+        params["customer_phone"] = customer_phone  # Also try snake_case variant
+    
+    query_string = urlencode(params, doseq=True)
+    full_url = f"{base_url}&{query_string}" if "?" in base_url else f"{base_url}?{query_string}"
+    
+    if PRODAMUS_TEST_MODE:
+        print(f"[Prodamus] Generated payment URL (test mode): {full_url}")
+    
+    return full_url
 
 # Load customizable texts
 texts = {}
@@ -136,9 +601,7 @@ def get_main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     if user_id in ADMIN_IDS:
         btn_admin_subs = types.KeyboardButton("📊 Все подписки")
         btn_admin_sheets = types.KeyboardButton("📋 Google Sheets")
-        btn_admin_broadcast = types.KeyboardButton("📣 Отправить рассылку")
         keyboard.add(btn_admin_subs, btn_admin_sheets)
-        keyboard.add(btn_admin_broadcast)
     
     return keyboard
 
@@ -263,6 +726,117 @@ def handle_active(message: telebot.types.Message):
 def handle_support(message: telebot.types.Message):
     bot.send_message(message.from_user.id, SUPPORT_MSG)
 
+# Handler for email input for Prodamus payments
+@bot.message_handler(func=lambda m: m.from_user.id in prodamus_pending_emails)
+def handle_prodamus_email(message: telebot.types.Message):
+    user_id = message.from_user.id
+    email_text = message.text.strip()
+    
+    # Validate email format
+    email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    if not re.match(email_pattern, email_text):
+        bot.send_message(user_id, "❌ Неверный формат email адреса. Пожалуйста, отправьте корректный email (например: example@mail.ru)")
+        return
+    
+    # Get pending payment info
+    if user_id not in prodamus_pending_emails:
+        bot.send_message(user_id, "❌ Сессия истекла. Пожалуйста, начните оплату заново.")
+        return
+    
+    payment_info = prodamus_pending_emails.pop(user_id)
+    course_id = payment_info["course_id"]
+    order_id = payment_info["order_id"]
+    price = payment_info["price"]
+    clean_name = payment_info["name"]
+    
+    # Save email to user profile
+    try:
+        user = get_user(user_id)
+        if user:
+            # Update user email in database (if you have email field)
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            # Try to add email column if it doesn't exist
+            try:
+                cur.execute("ALTER TABLE users ADD COLUMN email TEXT")
+            except sqlite3.OperationalError:
+                pass
+            cur.execute("UPDATE users SET email = ? WHERE user_id = ?", (email_text, user_id))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        print(f"Error saving email to user profile: {e}")
+    
+    # Generate payment URL with real email
+    customer_email = email_text
+    customer_phone = ""
+    
+    try:
+        payment_url = generate_prodamus_payment_url(
+            order_number=order_id,
+            amount=price,
+            product_name=clean_name,
+            customer_email=customer_email,
+            customer_phone=customer_phone
+        )
+        
+        # Store payment info in database
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_payments (
+                    invoice_id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    course_id TEXT,
+                    amount REAL,
+                    created_at INTEGER,
+                    payment_system TEXT,
+                    order_id TEXT
+                )
+            """)
+            try:
+                cur.execute("ALTER TABLE pending_payments ADD COLUMN payment_system TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute("ALTER TABLE pending_payments ADD COLUMN order_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+            
+            # Use order_id as primary key
+            cur.execute(
+                "INSERT OR REPLACE INTO pending_payments (invoice_id, user_id, course_id, amount, created_at, payment_system, order_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (order_id, user_id, course_id, price, int(time.time()), "prodamus", order_id)
+            )
+            conn.commit()
+            conn.close()
+            
+            if PRODAMUS_TEST_MODE:
+                print(f"[Prodamus] Stored pending payment with email: order_id={order_id}, email={customer_email}")
+        except Exception as e:
+            print(f"Error storing pending payment: {e}")
+        
+        # Send payment link to user
+        text = f"✅ Email сохранен!\n\n"
+        text += f"💳 Оплата курса: {clean_name}\n\n"
+        text += f"Сумма: {price:.2f} руб.\n\n"
+        text += "Нажмите на кнопку ниже, чтобы перейти к оплате:"
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("💳 Оплатить через Prodamus", url=payment_url))
+        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"course_{course_id}"))
+        
+        bot.send_message(user_id, text, reply_markup=kb)
+        
+        if PRODAMUS_TEST_MODE:
+            print(f"[Prodamus TEST MODE] Generated payment URL with email for order_id {order_id}: {payment_url}")
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Error generating Prodamus payment URL: {error_msg}")
+        bot.send_message(user_id, "❌ Ошибка при создании ссылки на оплату. Пожалуйста, попробуйте позже или обратитесь в поддержку.")
+
 
 # Handler for "Оферта" button
 @bot.message_handler(func=lambda m: m.text == "Оферта")
@@ -270,12 +844,10 @@ def handle_oferta(message: telebot.types.Message):
     user_id = message.from_user.id
     oferta_url = "https://github.com/george-dvoryak/cdn/blob/main/oferta.pdf?raw=true"
     try:
-        caption = f"Договор оферты (PDF)\nИНН: {OFFER_INN}\nФИО: {OFFER_FULL_NAME}"
-        bot.send_document(user_id, oferta_url, caption=caption)
+        bot.send_document(user_id, oferta_url, caption="Договор оферты (PDF)")
     except Exception:
         # Fallback: просто отправим ссылку, если по какой-то причине Telegram не скачал файл по URL
-        text = f"Договор оферты: {oferta_url}\n\nИНН: {OFFER_INN}\nФИО: {OFFER_FULL_NAME}"
-        bot.send_message(user_id, text, disable_web_page_preview=False)
+        bot.send_message(user_id, f"Договор оферты: {oferta_url}", disable_web_page_preview=False)
 
 # Admin handlers
 @bot.message_handler(func=lambda m: m.text == "📊 Все подписки")
@@ -379,7 +951,7 @@ def cb_course(c: telebot.types.CallbackQuery):
     name = course.get("name", "")
     desc = course.get("description", "")
     price = course.get("price", 0)
-    duration = course.get("duration_days", 0)
+    duration = course.get("duration_minutes", 0)
     image_url = course.get("image_url", "")
     channel_id = course.get("channel", "")
 
@@ -416,9 +988,16 @@ def cb_course(c: telebot.types.CallbackQuery):
 
     # Strip HTML from description too
     clean_desc = strip_html(desc) if desc else ""
-    text = f"{formatted_name}\n{clean_desc}\n\nЦена: {price} руб.\nДоступ: {duration} дн."
+    text = f"{formatted_name}\n{clean_desc}\n\nЦена: {price} руб.\nДоступ: {duration} мин."
     ikb = types.InlineKeyboardMarkup()
-    ikb.add(types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"))
+    # Add payment buttons
+    if ENABLE_PRODAMUS and PRODAMUS_SECRET_KEY:
+        ikb.row(
+            types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"),
+            types.InlineKeyboardButton("Купить (Prodamus)", callback_data=f"pay_prodamus_{course_id}")
+        )
+    else:
+        ikb.add(types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"))
     ikb.add(types.InlineKeyboardButton("⬅️ Назад к каталогу", callback_data="back_to_catalog"))
     
     # Try to edit existing message first, then fallback to sending new message
@@ -503,7 +1082,14 @@ def cb_buy(c: telebot.types.CallbackQuery):
     clean_name = strip_html(name) if name else "Курс"
     text = f"{clean_name}\nВыберите способ оплаты:"
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"))
+    # Add payment buttons
+    if ENABLE_PRODAMUS and PRODAMUS_SECRET_KEY:
+        kb.row(
+            types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"),
+            types.InlineKeyboardButton("Prodamus", callback_data=f"pay_prodamus_{course_id}")
+        )
+    else:
+        kb.add(types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"))
     try:
         bot.send_message(user_id, text, reply_markup=kb)
         bot.answer_callback_query(c.id)
@@ -592,15 +1178,180 @@ def cb_pay_yk(c: telebot.types.CallbackQuery):
         print("send_invoice (YK) error:", e)
         bot.answer_callback_query(c.id, "Ошибка при выставлении счета (ЮKassa).", show_alert=True)
 
-# (Robokassa handler removed)
+# Handler for Prodamus direct payments (via payment link)
+@bot.callback_query_handler(func=lambda c: c.data.startswith("pay_prodamus_"))
+def cb_pay_prodamus(c: telebot.types.CallbackQuery):
+    user_id = c.from_user.id
+    course_id = c.data.split("_", 2)[2]
+    
+    # Validate Prodamus configuration
+    if not PRODAMUS_SECRET_KEY:
+        bot.answer_callback_query(c.id, "Prodamus не настроена. Обратитесь к администратору.", show_alert=True)
+        return
+    
+    # Log test mode status
+    if PRODAMUS_TEST_MODE:
+        print(f"[Prodamus TEST MODE] Payment request from user {user_id} for course {course_id}")
+    
+    try:
+        courses = get_courses_data()
+    except Exception as e:
+        print(f"Error fetching courses for Prodamus payment: {e}")
+        bot.answer_callback_query(c.id, "Не удалось получить данные курса.", show_alert=True)
+        return
+    
+    course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
+    if not course:
+        bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
+        return
+    
+    if has_active_subscription(user_id, str(course_id)):
+        bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
+        return
+
+    name = course.get("name", "Курс")
+    price = float(course.get("price", 0))
+    
+    # Validate price
+    if price <= 0:
+        bot.answer_callback_query(c.id, "Неверная цена курса.", show_alert=True)
+        return
+
+    # Generate unique order ID for Prodamus
+    # Format: PROD-{timestamp}-{user_id}-{course_id} (ensures uniqueness and readability)
+    now_ts = datetime.datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    # Add microseconds for better uniqueness
+    now_us = datetime.datetime.utcnow().strftime("%f")[:3]  # milliseconds
+    order_id = f"PROD-{now_ts}{now_us}-{user_id}-{course_id}"
+
+    # Clean course name for description
+    clean_name = strip_html(name)
+    
+    # Check if we have user email saved in database
+    customer_email = ""
+    try:
+        user = get_user(user_id)
+        if user:
+            # Try to get email from user record (if email column exists)
+            # user is a Row object, so we can access by column name or index
+            if hasattr(user, 'keys') and 'email' in user.keys():
+                customer_email = user['email']
+            elif len(user) > 2:  # If email column exists (after user_id and username)
+                try:
+                    customer_email = user[2]  # Assuming email is 3rd column
+                except:
+                    pass
+    except Exception as e:
+        if PRODAMUS_TEST_MODE:
+            print(f"[Prodamus] Error getting user email: {e}")
+        pass
+    
+    # If no email, request it from user
+    if not customer_email:
+        # Store payment info in memory to continue after email is received
+        prodamus_pending_emails[user_id] = {
+            "course_id": course_id,
+            "order_id": order_id,
+            "price": price,
+            "name": clean_name
+        }
+        
+        # Request email from user
+        text = "📧 Для создания счета на оплату через Prodamus нужен ваш email адрес.\n\n"
+        text += "Пожалуйста, отправьте ваш email адрес:"
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("⬅️ Отмена", callback_data=f"course_{course_id}"))
+        
+        bot.send_message(user_id, text, reply_markup=kb)
+        bot.answer_callback_query(c.id)
+        return
+    
+    # We have email, proceed with payment URL generation
+    customer_phone = ""
+    
+    # Generate payment URL with all parameters (including email)
+    try:
+        payment_url = generate_prodamus_payment_url(
+            order_number=order_id,
+            amount=price,
+            product_name=clean_name,  # Use clean course name as product name
+            customer_email=customer_email,
+            customer_phone=customer_phone
+        )
+        
+        # Store payment info in database for later verification
+        try:
+            conn = sqlite3.connect(DATABASE_PATH)
+            cur = conn.cursor()
+            # Create pending_payments table if not exists
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS pending_payments (
+                    invoice_id TEXT PRIMARY KEY,
+                    user_id INTEGER,
+                    course_id TEXT,
+                    amount REAL,
+                    created_at INTEGER,
+                    payment_system TEXT,
+                    order_id TEXT
+                )
+            """)
+            # Add columns if they don't exist (migration)
+            try:
+                cur.execute("ALTER TABLE pending_payments ADD COLUMN payment_system TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cur.execute("ALTER TABLE pending_payments ADD COLUMN order_id TEXT")
+            except sqlite3.OperationalError:
+                pass
+            
+            # Store payment info in database
+            # Use order_id as primary key (since we're not using invoice_id anymore)
+            cur.execute(
+                "INSERT OR REPLACE INTO pending_payments (invoice_id, user_id, course_id, amount, created_at, payment_system, order_id) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (order_id, user_id, course_id, price, int(time.time()), "prodamus", order_id)
+            )
+            conn.commit()
+            conn.close()
+            
+            if PRODAMUS_TEST_MODE:
+                print(f"[Prodamus] Stored pending payment: order_id={order_id}, user_id={user_id}, course_id={course_id}, amount={price}, email={customer_email}")
+        except Exception as e:
+            print(f"Error storing pending payment: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        # Send payment link to user
+        clean_title_name = strip_html(name) if name else "Курс"
+        text = f"💳 Оплата курса: {clean_title_name}\n\n"
+        text += f"Сумма: {price:.2f} руб.\n\n"
+        text += "Нажмите на кнопку ниже, чтобы перейти к оплате:"
+        
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("💳 Оплатить через Prodamus", url=payment_url))
+        kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"course_{course_id}"))
+        
+        bot.send_message(user_id, text, reply_markup=kb)
+        bot.answer_callback_query(c.id)
+        
+        if PRODAMUS_TEST_MODE:
+            print(f"[Prodamus TEST MODE] Generated payment URL for order_id {order_id}: {payment_url}")
+            
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Error generating Prodamus payment URL: {error_msg}")
+        if PRODAMUS_TEST_MODE:
+            print(f"[Prodamus TEST MODE] Full error details: {repr(e)}")
+        bot.answer_callback_query(c.id, "Ошибка при создании ссылки на оплату.", show_alert=True)
 
 @bot.pre_checkout_query_handler(func=lambda q: True)
 def handle_pre_checkout(q: telebot.types.PreCheckoutQuery):
     try:
         user_id = q.from_user.id
         payload = q.invoice_payload
-        # Payload format: "user_id:course_id" (YooKassa) or "user_id:course_id:invoice_id" (Robokassa)
-        parts = payload.split(":", 2)
+        # Payload format: "user_id:course_id"
+        parts = payload.split(":", 1)
         if len(parts) < 2:
             bot.answer_pre_checkout_query(q.id, ok=False, error_message="Неверный формат заказа.")
             return
@@ -624,12 +1375,12 @@ def handle_successful_payment(message: telebot.types.Message):
     payment = message.successful_payment
     user_id = message.from_user.id
     payload = payment.invoice_payload
-    # Payload format: "user_id:course_id" (YooKassa) or "user_id:course_id:invoice_id" (Robokassa)
-    parts = payload.split(":", 2)
+    # Payload format: "user_id:course_id"
+    parts = payload.split(":", 1)
     if len(parts) < 2:
         bot.send_message(user_id, "Ошибка: неверный формат заказа. Обратитесь в поддержку.")
         return
-    # Extract course_id (second part), ignore user_id (first part) and invoice_id (third part if present)
+    # Extract course_id (second part)
     course_id = parts[1]
 
     try:
@@ -638,7 +1389,7 @@ def handle_successful_payment(message: telebot.types.Message):
         courses = []
     course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
     course_name = course.get("name", f"ID {course_id}") if course else f"ID {course_id}"
-    duration = int(course.get("duration_days", 0)) if course else 0
+    duration = int(course.get("duration_minutes", 0)) if course else 0
     channel = str(course.get("channel", "")) if course else ""
 
     expiry_ts = add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=payment.telegram_payment_charge_id)
@@ -699,6 +1450,86 @@ def send_receipt_to_tax(user_id: int, course_name: str, amount: float, buyer_ema
     print(f"[Receipt] user={user_id}, product='{course_name}', amount={amount}, email={buyer_email}")
 
 # Admin broadcasts
+@bot.message_handler(commands=['cleanup_expired'])
+def handle_cleanup_expired(message: telebot.types.Message):
+    """Admin command to manually trigger expired subscriptions cleanup"""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    
+    bot.reply_to(message, "🔄 Запуск очистки просроченных подписок...")
+    
+    try:
+        from db import get_expired_subscriptions, mark_subscription_expired, get_connection
+        import time as time_module
+        
+        # Run diagnostics
+        conn = get_connection()
+        cur = conn.cursor()
+        now = int(time_module.time())
+        
+        cur.execute("SELECT COUNT(*) FROM purchases WHERE expiry > 0 AND expiry <= ?", (now,))
+        expired_count = cur.fetchone()[0]
+        
+        cur.execute("SELECT COUNT(*) FROM purchases WHERE expiry > ?", (now,))
+        active_count = cur.fetchone()[0]
+        
+        report = f"📊 Статистика:\n"
+        report += f"• Просроченных (необработанных): {expired_count}\n"
+        report += f"• Активных: {active_count}\n\n"
+        
+        if expired_count == 0:
+            bot.reply_to(message, report + "✅ Просроченных подписок не найдено.")
+            return
+        
+        # Process expired subscriptions
+        expired = get_expired_subscriptions()
+        processed = 0
+        failed = 0
+        
+        for rec in expired:
+            try:
+                user_id = rec["user_id"]
+                course_id = rec["course_id"]
+                course_name = rec["course_name"]
+                channel_id = rec["channel_id"]
+                
+                if channel_id:
+                    ok = remove_user_from_channel(user_id, channel_id)
+                    if not ok:
+                        # Double check
+                        try:
+                            member = bot.get_chat_member(channel_id, user_id)
+                            status = getattr(member, "status", "unknown")
+                            if status in ("left", "kicked"):
+                                ok = True
+                        except:
+                            ok = True  # Assume removed if can't check
+                
+                mark_subscription_expired(user_id, course_id)
+                
+                # Try to notify user
+                try:
+                    clean_course_name = strip_html(course_name) if course_name else "курсу"
+                    bot.send_message(user_id, f"Доступ к курсу {clean_course_name} завершен. Спасибо, что были с нами!")
+                except:
+                    pass
+                
+                processed += 1
+            except Exception as e:
+                failed += 1
+                print(f"Error processing expired subscription: {e}")
+        
+        report += f"✅ Обработано: {processed}\n"
+        if failed > 0:
+            report += f"⚠️ Ошибок: {failed}"
+        
+        bot.reply_to(message, report)
+        
+    except Exception as e:
+        bot.reply_to(message, f"❌ Ошибка при очистке: {e}")
+        import traceback
+        print(f"Cleanup error: {traceback.format_exc()}")
+
 @bot.message_handler(commands=['broadcast_all', 'broadcast_buyers', 'broadcast_nonbuyers'])
 def handle_broadcast(message: telebot.types.Message):
     if message.from_user.id not in ADMIN_IDS:
@@ -747,213 +1578,79 @@ def handle_broadcast(message: telebot.types.Message):
     bot.reply_to(message, reply_msg)
 
 
-# =========================
-# Admin interactive broadcast
-# =========================
-
-# In-memory state for admin broadcast flows
-_broadcast_states = {}  # admin_id -> {"audience": str, "text": str, "photo": str|None, "step": str}
-
-def _get_recipients_by_audience(audience: str):
-    """
-    audience in {"all","active","inactive"}
-    active = users with at least one non-expired purchase
-    inactive = users with no non-expired purchases
-    """
-    now_ts = int(time.time())
-    recipients = []
-    try:
-        conn = sqlite3.connect(DATABASE_PATH)
-        cur = conn.cursor()
-        if audience == "all":
-            cur.execute("SELECT user_id FROM users;")
-        elif audience == "active":
-            cur.execute("SELECT DISTINCT user_id FROM purchases WHERE expiry > ?;", (now_ts,))
-        elif audience == "inactive":
-            cur.execute("SELECT user_id FROM users WHERE user_id NOT IN (SELECT DISTINCT user_id FROM purchases WHERE expiry > ?);", (now_ts,))
-        else:
-            cur.execute("SELECT user_id FROM users;")
-        rows = cur.fetchall()
-        recipients = [r[0] for r in rows]
-        conn.close()
-    except Exception as e:
-        print(f"_get_recipients_by_audience error: {e}")
-    return recipients
-
-def _broadcast_preview_keyboard():
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("✅ Подтвердить", callback_data="adm_bc_confirm"),
-        types.InlineKeyboardButton("❌ Отмена", callback_data="adm_bc_cancel")
-    )
-    kb.row(
-        types.InlineKeyboardButton("✏️ Изменить текст", callback_data="adm_bc_edit_text"),
-        types.InlineKeyboardButton("🖼️ Изменить фото", callback_data="adm_bc_edit_photo")
-    )
-    return kb
-
-def _broadcast_audience_keyboard():
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton("Всем", callback_data="adm_bc_aud_all"),
-        types.InlineKeyboardButton("С активной подпиской", callback_data="adm_bc_aud_active")
-    )
-    kb.row(
-        types.InlineKeyboardButton("Без активной подписки", callback_data="adm_bc_aud_inactive"),
-        types.InlineKeyboardButton("Отмена", callback_data="adm_bc_cancel")
-    )
-    return kb
-
-def _broadcast_skip_photo_keyboard():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("Пропустить фото", callback_data="adm_bc_skip_photo"))
-    kb.add(types.InlineKeyboardButton("Отмена", callback_data="adm_bc_cancel"))
-    return kb
-
-@bot.message_handler(func=lambda m: m.text == "📣 Отправить рассылку")
-def handle_admin_broadcast_entry(message: telebot.types.Message):
-    user_id = message.from_user.id
-    if user_id not in ADMIN_IDS:
-        return
-    _broadcast_states[user_id] = {"audience": None, "text": None, "photo": None, "step": "audience"}
-    bot.send_message(user_id, "Выберите аудиторию для рассылки:", reply_markup=_broadcast_audience_keyboard())
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("adm_bc_aud_"))
-def handle_admin_broadcast_audience(c: telebot.types.CallbackQuery):
-    user_id = c.from_user.id
-    if user_id not in ADMIN_IDS:
-        bot.answer_callback_query(c.id)
-        return
-    state = _broadcast_states.get(user_id) or {}
-    if c.data == "adm_bc_aud_all":
-        state["audience"] = "all"
-    elif c.data == "adm_bc_aud_active":
-        state["audience"] = "active"
-    elif c.data == "adm_bc_aud_inactive":
-        state["audience"] = "inactive"
-    else:
-        bot.answer_callback_query(c.id)
-        return
-    state["step"] = "await_text"
-    _broadcast_states[user_id] = state
-    bot.answer_callback_query(c.id)
-    bot.send_message(user_id, "Отправьте текст рассылки одним сообщением.")
-
-@bot.message_handler(func=lambda m: _broadcast_states.get(m.from_user.id, {}).get("step") == "await_text", content_types=['text'])
-def handle_admin_broadcast_text(message: telebot.types.Message):
-    user_id = message.from_user.id
-    if user_id not in ADMIN_IDS:
-        return
-    state = _broadcast_states.get(user_id)
-    if not state:
-        return
-    state["text"] = message.text
-    state["step"] = "await_photo"
-    _broadcast_states[user_id] = state
-    bot.send_message(user_id, "Теперь пришлите фото (необязательно). Можно пропустить:", reply_markup=_broadcast_skip_photo_keyboard())
-
-@bot.message_handler(func=lambda m: _broadcast_states.get(m.from_user.id, {}).get("step") == "await_photo", content_types=['photo'])
-def handle_admin_broadcast_photo(message: telebot.types.Message):
-    user_id = message.from_user.id
-    if user_id not in ADMIN_IDS:
-        return
-    state = _broadcast_states.get(user_id)
-    if not state:
-        return
-    try:
-        photo_sizes = message.photo or []
-        if not photo_sizes:
-            return
-        largest = photo_sizes[-1]
-        state["photo"] = largest.file_id
-    except Exception:
-        state["photo"] = None
-    state["step"] = "confirm"
-    _broadcast_states[user_id] = state
-    _send_broadcast_preview(user_id, state)
-
-@bot.callback_query_handler(func=lambda c: c.data in ("adm_bc_skip_photo", "adm_bc_edit_text", "adm_bc_edit_photo", "adm_bc_confirm", "adm_bc_cancel"))
-def handle_admin_broadcast_callbacks(c: telebot.types.CallbackQuery):
-    user_id = c.from_user.id
-    if user_id not in ADMIN_IDS:
-        bot.answer_callback_query(c.id)
-        return
-    state = _broadcast_states.get(user_id)
-    if not state:
-        bot.answer_callback_query(c.id)
-        return
-    data = c.data
-    if data == "adm_bc_skip_photo":
-        state["photo"] = None
-        state["step"] = "confirm"
-        _broadcast_states[user_id] = state
-        bot.answer_callback_query(c.id)
-        _send_broadcast_preview(user_id, state)
-        return
-    if data == "adm_bc_edit_text":
-        state["step"] = "await_text"
-        _broadcast_states[user_id] = state
-        bot.answer_callback_query(c.id)
-        bot.send_message(user_id, "Отправьте новый текст рассылки.")
-        return
-    if data == "adm_bc_edit_photo":
-        state["step"] = "await_photo"
-        state["photo"] = None
-        _broadcast_states[user_id] = state
-        bot.answer_callback_query(c.id)
-        bot.send_message(user_id, "Пришлите новое фото или пропустите:", reply_markup=_broadcast_skip_photo_keyboard())
-        return
-    if data == "adm_bc_cancel":
-        _broadcast_states.pop(user_id, None)
-        bot.answer_callback_query(c.id, "Рассылка отменена.")
-        bot.send_message(user_id, "Отменено.")
-        return
-    if data == "adm_bc_confirm":
-        audience = state.get("audience") or "all"
-        text = state.get("text") or ""
-        photo = state.get("photo")
-        recipients = _get_recipients_by_audience(audience)
-        sent = 0
-        failed = 0
-        for uid in recipients:
-            try:
-                if photo:
-                    bot.send_photo(uid, photo, caption=text)
-                else:
-                    bot.send_message(uid, text, disable_web_page_preview=True)
-                sent += 1
-            except Exception as e:
-                failed += 1
-                if failed <= 3:
-                    print(f"Broadcast send failed to {uid}: {e}")
-        total = len(recipients)
-        _broadcast_states.pop(user_id, None)
-        bot.answer_callback_query(c.id)
-        bot.send_message(user_id, f"Отправлено {sent} из {total}. Не удалось: {failed}.")
-        return
-
-def _send_broadcast_preview(user_id: int, state: dict):
-    try:
-        text = state.get("text") or ""
-        photo = state.get("photo")
-        kb = _broadcast_preview_keyboard()
-        preview_title = "Предпросмотр рассылки:"
-        if photo:
-            bot.send_photo(user_id, photo, caption=f"{preview_title}\n\n{text}", reply_markup=kb)
-        else:
-            bot.send_message(user_id, f"{preview_title}\n\n{text}", reply_markup=kb, disable_web_page_preview=True)
-    except Exception as e:
-        print(f"_send_broadcast_preview error: {e}")
-        bot.send_message(user_id, "Не удалось показать предпросмотр. Попробуйте ещё раз.")
-
-
 def remove_user_from_channel(user_id: int, channel_id: str):
+    """
+    Remove user from channel by banning and immediately unbanning.
+    This effectively removes the user from the channel.
+    """
+    import datetime
+    timestamp = datetime.datetime.now().isoformat()
+    
+    if not channel_id:
+        print(f"[{timestamp}] [remove_user_from_channel] ERROR: No channel_id provided for user {user_id}")
+        return False
+    
+    print(f"[{timestamp}] [remove_user_from_channel] Starting removal process: user_id={user_id}, channel_id={channel_id}")
+    
+    # First, check if user is actually a member before attempting removal
     try:
-        bot.ban_chat_member(chat_id=channel_id, user_id=user_id)
-        bot.unban_chat_member(chat_id=channel_id, user_id=user_id)
-        return True
+        print(f"[{timestamp}] [remove_user_from_channel] Checking user membership status...")
+        member = bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+        member_status = getattr(member, "status", "unknown")
+        print(f"[{timestamp}] [remove_user_from_channel] User {user_id} current status in channel {channel_id}: {member_status}")
+        
+        if member_status in ("left", "kicked"):
+            print(f"[{timestamp}] [remove_user_from_channel] User {user_id} already not a member (status: {member_status}), skipping removal")
+            return True
     except Exception as e:
-        print(f"Failed to remove {user_id} from {channel_id}: {e}")
+        error_msg = str(e).lower()
+        print(f"[{timestamp}] [remove_user_from_channel] Warning: Could not check membership status: {e}")
+        # Continue with removal attempt anyway
+    
+    try:
+        print(f"[{timestamp}] [remove_user_from_channel] Attempting to ban user {user_id} from channel {channel_id}...")
+        # First, try to ban the user (removes them from channel)
+        bot.ban_chat_member(chat_id=channel_id, user_id=user_id, until_date=None)
+        print(f"[{timestamp}] [remove_user_from_channel] Successfully banned user {user_id}")
+        
+        # Then immediately unban (allows them to rejoin if needed, but they're already removed)
+        print(f"[{timestamp}] [remove_user_from_channel] Unbanning user {user_id}...")
+        bot.unban_chat_member(chat_id=channel_id, user_id=user_id, only_if_banned=True)
+        print(f"[{timestamp}] [remove_user_from_channel] Successfully unbanned user {user_id}")
+        
+        # Verify removal by checking status again
+        try:
+            member = bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            final_status = getattr(member, "status", "unknown")
+            print(f"[{timestamp}] [remove_user_from_channel] Verification: User {user_id} final status: {final_status}")
+            if final_status in ("left", "kicked"):
+                print(f"[{timestamp}] [remove_user_from_channel] ✅ SUCCESS: User {user_id} successfully removed from channel {channel_id}")
+                return True
+            else:
+                print(f"[{timestamp}] [remove_user_from_channel] ⚠️ WARNING: User {user_id} still has status '{final_status}' after ban/unban")
+                return True  # Still return True as ban/unban succeeded
+        except Exception as verify_e:
+            print(f"[{timestamp}] [remove_user_from_channel] Could not verify removal status: {verify_e}")
+            # If we can't verify but ban/unban succeeded, assume success
+            print(f"[{timestamp}] [remove_user_from_channel] ✅ SUCCESS: Ban/unban completed, assuming removal successful")
+            return True
+            
+    except Exception as e:
+        error_msg = str(e).lower()
+        print(f"[{timestamp}] [remove_user_from_channel] ERROR during ban/unban: {e}")
+        print(f"[{timestamp}] [remove_user_from_channel] Error type: {type(e).__name__}")
+        
+        # Check if user is already not a member
+        if any(s in error_msg for s in ("user not found", "user is not a member", "chat not found")):
+            print(f"[{timestamp}] [remove_user_from_channel] User {user_id} already not a member of {channel_id} (error indicates this)")
+            return True
+        
+        # Check if bot doesn't have admin rights
+        if any(s in error_msg for s in ("not enough rights", "not an admin", "can't ban", "can't restrict")):
+            print(f"[{timestamp}] [remove_user_from_channel] ❌ FAILED: Bot doesn't have admin rights in {channel_id}: {e}")
+            return False
+        
+        print(f"[{timestamp}] [remove_user_from_channel] ❌ FAILED: Unknown error removing {user_id} from {channel_id}: {e}")
         return False
 
 
