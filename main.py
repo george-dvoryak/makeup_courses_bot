@@ -630,13 +630,41 @@ def handle_start(message: telebot.types.Message):
     # Use dynamic keyboard that includes admin buttons if user is admin
     keyboard = get_main_menu_keyboard(user_id)
     welcome_image_url = texts.get("welcome_image_url")
-    try:
-        if welcome_image_url:
+    
+    # Try to send welcome message with photo if available
+    message_sent = False
+    if welcome_image_url:
+        try:
             bot.send_photo(user_id, welcome_image_url, caption=WELCOME_MSG, reply_markup=keyboard)
-        else:
+            message_sent = True
+        except Exception as e:
+            error_msg = str(e).lower()
+            # If user blocked bot or chat not found, don't try to send text message
+            if "chat not found" in error_msg or "bot was blocked" in error_msg or "user is deactivated" in error_msg:
+                print(f"User {user_id} blocked bot or chat not found, skipping welcome message")
+                return
+            # For other errors, try to send text message
+            try:
+                bot.send_message(user_id, WELCOME_MSG, reply_markup=keyboard)
+                message_sent = True
+            except Exception as e2:
+                error_msg2 = str(e2).lower()
+                if "chat not found" in error_msg2 or "bot was blocked" in error_msg2 or "user is deactivated" in error_msg2:
+                    print(f"User {user_id} blocked bot or chat not found, skipping welcome message")
+                    return
+                print(f"Failed to send welcome message to user {user_id}: {e2}")
+    
+    # If no photo or photo send failed, send text message
+    if not message_sent:
+        try:
             bot.send_message(user_id, WELCOME_MSG, reply_markup=keyboard)
-    except Exception:
-        bot.send_message(user_id, WELCOME_MSG, reply_markup=keyboard)
+        except Exception as e:
+            error_msg = str(e).lower()
+            # If user blocked bot or chat not found, just log and return
+            if "chat not found" in error_msg or "bot was blocked" in error_msg or "user is deactivated" in error_msg:
+                print(f"User {user_id} blocked bot or chat not found, skipping welcome message")
+                return
+            print(f"Failed to send welcome message to user {user_id}: {e}")
 
 def send_catalog_message(user_id, edit_message=None, edit_message_id=None, edit_chat_id=None):
     """Helper function to send/update catalog message"""

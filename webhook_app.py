@@ -195,9 +195,14 @@ if WEBHOOK_PATH:
                 bot.process_new_updates([update])
                 print(f"[{datetime.now()}] [Webhook] ✅ Update processed successfully", file=sys.stderr)
             except Exception as e:
-                print(f"[{datetime.now()}] [Webhook] ❌ Error in bot.process_new_updates: {e}", file=sys.stderr)
-                import traceback
-                traceback.print_exc(file=sys.stderr)
+                error_msg = str(e).lower()
+                # Log error but don't fail - some errors are expected (e.g., user blocked bot)
+                if "chat not found" in error_msg or "bot was blocked" in error_msg or "user is deactivated" in error_msg:
+                    print(f"[{datetime.now()}] [Webhook] ⚠️ User blocked bot or chat not found (expected for some users)", file=sys.stderr)
+                else:
+                    print(f"[{datetime.now()}] [Webhook] ❌ Error in bot.process_new_updates: {e}", file=sys.stderr)
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
             
         except Exception as e:
             print(f"[{datetime.now()}] [Webhook] ❌ Error processing update: {e}", file=sys.stderr)
