@@ -132,19 +132,31 @@ def health_check():
     """Health check endpoint to verify app is running"""
     return "OK", 200
 
-# Reset and set webhook
+# Reset and set webhook (only if not already set correctly)
 if WEBHOOK_URL:
     try:
-        bot.remove_webhook()
-        bot.set_webhook(
-            url=WEBHOOK_URL,
-            secret_token=WEBHOOK_SECRET_TOKEN,
-            drop_pending_updates=True,
-            allowed_updates=["message", "callback_query", "shipping_query", "pre_checkout_query"]
-        )
-        print(f"Webhook set to: {WEBHOOK_URL}")
+        # Check current webhook status first
+        current_webhook = bot.get_webhook_info()
+        if current_webhook.url != WEBHOOK_URL:
+            # Webhook is not set or set to wrong URL - update it
+            bot.remove_webhook()
+            bot.set_webhook(
+                url=WEBHOOK_URL,
+                secret_token=WEBHOOK_SECRET_TOKEN,
+                drop_pending_updates=True,
+                allowed_updates=["message", "callback_query", "shipping_query", "pre_checkout_query"]
+            )
+            print(f"Webhook set to: {WEBHOOK_URL}")
+        else:
+            # Webhook is already set correctly
+            print(f"Webhook already set to: {WEBHOOK_URL}")
     except Exception as e:
-        print("Webhook setup error:", e)
+        error_msg = str(e).lower()
+        if "429" in error_msg or "too many requests" in error_msg:
+            # Rate limit - don't spam, just log
+            print(f"Webhook setup skipped (rate limit): {e}")
+        else:
+            print(f"Webhook setup error: {e}")
 
 # Webhook endpoint - use WEBHOOK_PATH if available, otherwise fallback to token-based path
 if WEBHOOK_PATH:
