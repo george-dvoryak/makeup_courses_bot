@@ -102,12 +102,18 @@ try:
                 
                 if set_data.get("ok"):
                     print("   ✅ Webhook успешно установлен!")
-                    print(f"   URL: {set_data.get('result', {}).get('url', WEBHOOK_URL)}")
+                    result = set_data.get('result', {})
+                    if isinstance(result, dict):
+                        print(f"   URL: {result.get('url', WEBHOOK_URL)}")
+                    else:
+                        print(f"   URL: {WEBHOOK_URL}")
                 else:
-                    print(f"   ❌ Ошибка установки webhook: {set_data.get('description')}")
+                    print(f"   ❌ Ошибка установки webhook: {set_data.get('description', 'Unknown error')}")
                     if set_data.get("error_code") == 429:
-                        retry_after = set_data.get("parameters", {}).get("retry_after", 0)
-                        print(f"   ⚠️ Слишком много запросов. Подождите {retry_after} секунд")
+                        params = set_data.get("parameters", {})
+                        if isinstance(params, dict):
+                            retry_after = params.get("retry_after", 0)
+                            print(f"   ⚠️ Слишком много запросов. Подождите {retry_after} секунд")
             except Exception as e:
                 print(f"   ❌ Ошибка установки webhook: {e}")
         else:
