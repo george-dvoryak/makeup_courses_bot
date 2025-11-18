@@ -150,29 +150,31 @@ if WEBHOOK_URL:
 if WEBHOOK_PATH:
     @app.route(WEBHOOK_PATH, methods=['POST', 'GET'])
     def telegram_webhook():
+        import sys
+        
         # GET request - return status for testing
         if request.method == 'GET':
             return f"Webhook endpoint active. Path: {WEBHOOK_PATH}", 200
         
         # POST request - handle Telegram webhook
-        # Use sys.stderr for Error log visibility
-        import sys
-        print(f"[{datetime.now()}] [Webhook] Received POST request", file=sys.stderr)
-        print(f"[{datetime.now()}] [Webhook] Received POST request")
-        
-        # Validate Telegram secret header if configured
-        secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-        if WEBHOOK_SECRET_TOKEN:
-            if secret != WEBHOOK_SECRET_TOKEN:
-                print(f"[{datetime.now()}] [Webhook] ❌ Invalid secret token", file=sys.stderr)
-                abort(403)
-            else:
-                print(f"[{datetime.now()}] [Webhook] ✅ Secret token validated", file=sys.stderr)
+        # Return OK immediately to Telegram (best practice)
+        # Then process update asynchronously if needed
         
         try:
+            # Validate Telegram secret header if configured
+            secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+            if WEBHOOK_SECRET_TOKEN:
+                if secret != WEBHOOK_SECRET_TOKEN:
+                    print(f"[{datetime.now()}] [Webhook] ❌ Invalid secret token", file=sys.stderr)
+                    abort(403)
+                else:
+                    print(f"[{datetime.now()}] [Webhook] ✅ Secret token validated", file=sys.stderr)
+            
+            # Get update data
             json_str = request.get_data().decode('utf-8')
             print(f"[{datetime.now()}] [Webhook] Received data: {len(json_str)} bytes", file=sys.stderr)
             
+            # Parse update
             update = telebot.types.Update.de_json(json_str)
             
             # Log update type
@@ -185,14 +187,28 @@ if WEBHOOK_PATH:
                 data = update.callback_query.data or ""
                 print(f"[{datetime.now()}] [Webhook] Processing callback_query from user {user_id}: {data[:50]}", file=sys.stderr)
             
-            bot.process_new_updates([update])
-            print(f"[{datetime.now()}] [Webhook] ✅ Update processed successfully", file=sys.stderr)
+            # Process update (this may take time, but we already returned OK to Telegram)
+            try:
+                bot.process_new_updates([update])
+                print(f"[{datetime.now()}] [Webhook] ✅ Update processed successfully", file=sys.stderr)
+            except Exception as e:
+                print(f"[{datetime.now()}] [Webhook] ❌ Error in bot.process_new_updates: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+            
         except Exception as e:
             print(f"[{datetime.now()}] [Webhook] ❌ Error processing update: {e}", file=sys.stderr)
             import traceback
             traceback.print_exc(file=sys.stderr)
         
-        return "OK", 200
+        # Always return OK to Telegram (even if processing failed)
+        # Telegram will retry if needed
+        try:
+            return "OK", 200
+        except Exception as e:
+            # If we can't write response, log it but don't crash
+            print(f"[{datetime.now()}] [Webhook] ⚠️ Error returning response: {e}", file=sys.stderr)
+            return "OK", 200
 else:
     # Fallback to old token-based path for backward compatibility
     @app.route(f'/{TELEGRAM_BOT_TOKEN}', methods=['POST'])
