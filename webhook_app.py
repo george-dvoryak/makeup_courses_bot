@@ -3,9 +3,10 @@ from flask import Flask, request, abort
 import telebot
 import threading
 import time
+import sys
 from datetime import datetime
 
-from config import TELEGRAM_BOT_TOKEN, WEBHOOK_URL, WEBHOOK_PATH, WEBHOOK_SECRET_TOKEN
+from config import TELEGRAM_BOT_TOKEN, WEBHOOK_URL, WEBHOOK_PATH, WEBHOOK_SECRET_TOKEN, ENABLE_PRODAMUS
 from main import bot  # handlers are already registered on import
 
 app = Flask(__name__)
@@ -240,6 +241,242 @@ else:
         except Exception as e:
             print("Webhook handling error:", e)
         return "OK", 200
+
+# Prodamus webhook endpoints (if enabled)
+if ENABLE_PRODAMUS:
+    @app.route("/prodamus/result", methods=["GET", "POST"])
+    def prodamus_result():
+        """
+        Handle Prodamus Result URL notification (payment status update)
+        This endpoint receives payment notifications from Prodamus
+        Must return "OK" if payment is valid, or error code otherwise
+        """
+        import sys
+        try:
+            # Import Prodamus handlers from main.py
+            from main import (
+                verify_prodamus_signature,
+                forward_to_test_webhook
+            )
+            from config import PRODAMUS_SECRET_KEY
+            
+            # Get request data (can be GET or POST)
+            if request.method == "GET":
+                data = request.args.to_dict()
+            else:
+                data = request.form.to_dict() if request.form else request.get_json() or {}
+            
+            # For POST requests, check signature in header (Prodamus sends it as 'sign' header)
+            if request.method == "POST" and "sign" in request.headers:
+                data["signature"] = request.headers.get("sign", "")
+            
+            # Log the notification for debugging (use sys.stderr for PythonAnywhere)
+            print(f"[{datetime.now()}] [Prodamus Result] Received notification: {data}", file=sys.stderr)
+            print(f"[{datetime.now()}] [Prodamus Result] Request method: {request.method}", file=sys.stderr)
+            print(f"[{datetime.now()}] [Prodamus Result] Request headers: {dict(request.headers)}", file=sys.stderr)
+            
+            # Forward to test webhook if configured
+            forward_to_test_webhook("result", data, request.method)
+            
+            # Verify signature if secret key is configured
+            if PRODAMUS_SECRET_KEY:
+                if not verify_prodamus_signature(data, PRODAMUS_SECRET_KEY):
+                    print(f"[{datetime.now()}] [Prodamus Result] ❌ Invalid signature", file=sys.stderr)
+                    return "ERROR: Invalid signature", 400
+                else:
+                    print(f"[{datetime.now()}] [Prodamus Result] ✅ Signature verified", file=sys.stderr)
+            
+            # Call the main handler function
+            # We need to temporarily replace request object in main module
+            # Actually, let's just call the handler directly with our data
+            from main import (
+                get_courses_data, add_purchase, strip_html,
+                ADMIN_IDS, DATABASE_PATH, bot as main_bot
+            )
+            import sqlite3
+            from telebot import types
+            import datetime as dt
+            
+            # Extract required parameters
+            order_number = data.get("order_num", "") or data.get("order_id", "") or data.get("order", "")
+            amount = data.get("sum", "") or data.get("amount", "")
+            payment_status = (data.get("payment_status", "") or data.get("status", "")).lower()
+            
+            print(f"[{datetime.now()}] [Prodamus Result] Order: {order_number}, Amount: {amount}, Status: {payment_status}", file=sys.stderr)
+            
+            if not order_number or not amount:
+                print(f"[{datetime.now()}] [Prodamus Result] ❌ Missing required parameters. Received data: {data}", file=sys.stderr)
+                return "ERROR: Missing parameters", 400
+            
+            # Only process successful payments
+            if payment_status not in ("success", "paid", "successful"):
+                print(f"[{datetime.now()}] [Prodamus Result] ⚠️ Payment not successful, status: {payment_status}", file=sys.stderr)
+                return "OK", 200  # Still return OK to acknowledge receipt
+            
+            # Find pending payment in database
+            try:
+                conn = sqlite3.connect(DATABASE_PATH)
+                cur = conn.cursor()
+                # Create pending_payments table if not exists
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS pending_payments (
+                        invoice_id TEXT PRIMARY KEY,
+                        user_id INTEGER,
+                        course_id TEXT,
+                        amount REAL,
+                        created_at INTEGER,
+                        payment_system TEXT,
+                        order_id TEXT
+                    )
+                """)
+                # Add columns if they don't exist (migration)
+                try:
+                    cur.execute("ALTER TABLE pending_payments ADD COLUMN payment_system TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                try:
+                    cur.execute("ALTER TABLE pending_payments ADD COLUMN order_id TEXT")
+                except sqlite3.OperationalError:
+                    pass
+                
+                # Try to find by order_id or invoice_id
+                cur.execute("SELECT user_id, course_id, amount FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
+                row = cur.fetchone()
+                
+                if not row:
+                    print(f"[{datetime.now()}] [Prodamus Result] ❌ Payment not found for order/invoice {order_number}", file=sys.stderr)
+                    conn.close()
+                    return "ERROR: Payment not found", 404
+                
+                user_id, course_id, expected_amount = row[0], row[1], row[2]
+                
+                # Verify amount matches
+                if abs(float(amount) - float(expected_amount)) > 0.01:
+                    print(f"[{datetime.now()}] [Prodamus Result] ❌ Amount mismatch for order {order_number}: expected {expected_amount}, got {amount}", file=sys.stderr)
+                    conn.close()
+                    return "ERROR: Amount mismatch", 400
+                
+                # Get course data
+                try:
+                    courses = get_courses_data()
+                    course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
+                    if not course:
+                        print(f"[{datetime.now()}] [Prodamus Result] ❌ Course {course_id} not found", file=sys.stderr)
+                        conn.close()
+                        return "ERROR: Course not found", 404
+                    
+                    course_name = course.get("name", f"ID {course_id}")
+                    duration = course.get("duration_days")
+                    channel = str(course.get("channel", ""))
+                    
+                    # Add purchase to database
+                    expiry_ts = add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"prodamus_{order_number}")
+                    
+                    # Remove from pending payments
+                    cur.execute("DELETE FROM pending_payments WHERE order_id = ?", (order_number,))
+                    conn.commit()
+                    conn.close()
+                    
+                    # Send success message to user
+                    clean_course_name = strip_html(course_name) if course_name else f"ID {course_id}"
+                    text = f"✅ Оплата успешно получена!\n\n"
+                    text += f"Вам предоставлен доступ к курсу: {clean_course_name}"
+                    
+                    # Create invite link if channel exists
+                    invite_link = None
+                    if channel:
+                        try:
+                            expire_date = dt.datetime.now() + dt.timedelta(days=1)
+                            invite = main_bot.create_chat_invite_link(
+                                chat_id=channel,
+                                member_limit=1,
+                                expire_date=expire_date
+                            )
+                            invite_link = invite.invite_link
+                        except Exception as e:
+                            print(f"[{datetime.now()}] [Prodamus Result] ⚠️ create_chat_invite_link failed for {channel}: {e}", file=sys.stderr)
+                    
+                    if invite_link:
+                        text += "\n\nНажмите кнопку ниже, чтобы перейти к материалам курса."
+                        kb = types.InlineKeyboardMarkup()
+                        kb.add(types.InlineKeyboardButton("Перейти в канал курса", url=invite_link))
+                        main_bot.send_message(user_id, text, reply_markup=kb)
+                    else:
+                        main_bot.send_message(user_id, text)
+                    
+                    # Notify admins
+                    admin_text = f"💰 Оплата Prodamus: пользователь {user_id} купил {clean_course_name} на сумму {amount} руб. (Order: {order_number})"
+                    for aid in ADMIN_IDS:
+                        try:
+                            main_bot.send_message(aid, admin_text)
+                        except Exception:
+                            pass
+                    
+                    print(f"[{datetime.now()}] [Prodamus Result] ✅ Successfully processed payment for order {order_number}, user {user_id}", file=sys.stderr)
+                    return "OK", 200
+                    
+                except Exception as e:
+                    print(f"[{datetime.now()}] [Prodamus Result] ❌ Error processing payment: {e}", file=sys.stderr)
+                    import traceback
+                    traceback.print_exc(file=sys.stderr)
+                    conn.close()
+                    return "ERROR: Processing error", 500
+                    
+            except Exception as e:
+                print(f"[{datetime.now()}] [Prodamus Result] ❌ Database error: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+                return "ERROR: Database error", 500
+            
+        except Exception as e:
+            print(f"[{datetime.now()}] [Prodamus Result] ❌ Error: {e}", file=sys.stderr)
+            import traceback
+            traceback.print_exc(file=sys.stderr)
+            return "ERROR", 500
+    
+    @app.route("/prodamus/success", methods=["GET", "POST"])
+    def prodamus_success():
+        """Handle Prodamus Success URL (user redirected after successful payment)"""
+        import sys
+        try:
+            from main import forward_to_test_webhook
+            
+            if request.method == "GET":
+                data = request.args.to_dict()
+            else:
+                data = request.form.to_dict() if request.form else request.get_json() or {}
+            
+            print(f"[{datetime.now()}] [Prodamus Success] User redirected: {data}", file=sys.stderr)
+            
+            # Forward to test webhook if configured
+            forward_to_test_webhook("success", data, request.method)
+            
+            return "Payment successful! You can close this page.", 200
+        except Exception as e:
+            print(f"[{datetime.now()}] [Prodamus Success] Error: {e}", file=sys.stderr)
+            return "ERROR", 500
+    
+    @app.route("/prodamus/fail", methods=["GET", "POST"])
+    def prodamus_fail():
+        """Handle Prodamus Fail URL (user redirected after failed payment)"""
+        import sys
+        try:
+            from main import forward_to_test_webhook
+            
+            if request.method == "GET":
+                data = request.args.to_dict()
+            else:
+                data = request.form.to_dict() if request.form else request.get_json() or {}
+            
+            print(f"[{datetime.now()}] [Prodamus Fail] User redirected: {data}", file=sys.stderr)
+            
+            # Forward to test webhook if configured
+            forward_to_test_webhook("fail", data, request.method)
+            
+            return "Payment failed. Please try again.", 200
+        except Exception as e:
+            print(f"[{datetime.now()}] [Prodamus Fail] Error: {e}", file=sys.stderr)
+            return "ERROR", 500
 
 # For PythonAnywhere WSGI:
 # In your WSGI file, import: from webhook_app import app as application
