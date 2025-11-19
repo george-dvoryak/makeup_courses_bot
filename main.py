@@ -215,7 +215,16 @@ def prodamus_result():
                 invite_link = None
                 if channel:
                     try:
-                        invite = bot.create_chat_invite_link(chat_id=channel, member_limit=1, expire_date=None)
+                        # Set expire_date to 1 day after purchase
+                        expire_date = datetime.datetime.now() + datetime.timedelta(days=1)
+                        
+                        # Create invite link with appropriate parameters
+                        # member_limit=1 means single use (one-time link)
+                        invite = bot.create_chat_invite_link(
+                            chat_id=channel,
+                            member_limit=1,  # Single use - one-time link
+                            expire_date=expire_date  # Expires 1 day after purchase
+                        )
                         invite_link = invite.invite_link
                     except Exception as e:
                         print(f"create_chat_invite_link failed for {channel}: {e}")
@@ -741,24 +750,55 @@ def handle_active(message: telebot.types.Message):
     if not subs:
         bot.send_message(user_id, "У вас нет активных подписок.")
         return
-    text = "Ваши активные подписки:\n"
+    
+    text = "Ваши активные подписки:\n\n"
+    ikb = types.InlineKeyboardMarkup()
+    
     for s in subs:
         course_name = s["course_name"]
         clean_course_name = strip_html(course_name) if course_name else "Курс"
         channel_id = s["channel_id"]
         expiry_ts = s["expiry"]
-        # If expiry_ts is 0, subscription is unlimited
+        
+        # Format subscription info
         if expiry_ts == 0:
-            text += f"• {clean_course_name} (бессрочный доступ) – "
+            text += f"• {clean_course_name}\n   Бессрочный доступ\n\n"
         else:
             dt = datetime.datetime.fromtimestamp(expiry_ts)
             dstr = dt.strftime("%Y-%m-%d")
-            text += f"• {clean_course_name} (доступ до {dstr}) – "
-        if str(channel_id).startswith("@"):
-            text += f"{channel_id}\n"
-        else:
-            text += "ссылка недоступна\n"
-    bot.send_message(user_id, text, disable_web_page_preview=True)
+            text += f"• {clean_course_name}\n   Доступ до {dstr}\n\n"
+        
+        # Create invite link for channel
+        if channel_id:
+            if str(channel_id).startswith("@"):
+                # Public channel - use direct link
+                url = f"https://t.me/{channel_id[1:]}"
+                ikb.add(types.InlineKeyboardButton(f"📺 {clean_course_name}", url=url))
+            else:
+                # Private channel - create invite link
+                invite_link = None
+                try:
+                    # Set expire_date to 1 day from now
+                    expire_date = datetime.datetime.now() + datetime.timedelta(days=1)
+                    
+                    # Create invite link with appropriate parameters
+                    # member_limit=1 means single use (one-time link)
+                    invite = bot.create_chat_invite_link(
+                        chat_id=channel_id,
+                        member_limit=1,  # Single use - one-time link
+                        expire_date=expire_date  # Expires 1 day from now
+                    )
+                    invite_link = invite.invite_link
+                except Exception as e:
+                    print(f"create_chat_invite_link failed for {channel_id}: {e}")
+                
+                if invite_link:
+                    ikb.add(types.InlineKeyboardButton(f"📺 {clean_course_name}", url=invite_link))
+    
+    if ikb.keyboard:
+        bot.send_message(user_id, text, reply_markup=ikb, disable_web_page_preview=True)
+    else:
+        bot.send_message(user_id, text, disable_web_page_preview=True)
 
 @bot.message_handler(func=lambda m: m.text == "Поддержка")
 def handle_support(message: telebot.types.Message):
@@ -1011,7 +1051,16 @@ def cb_course(c: telebot.types.CallbackQuery):
             else:
                 invite_link = None
                 try:
-                    invite = bot.create_chat_invite_link(chat_id=channel_id, member_limit=1, expire_date=None)
+                    # Set expire_date to 1 day from now
+                    expire_date = datetime.datetime.now() + datetime.timedelta(days=1)
+                    
+                    # Create invite link with appropriate parameters
+                    # member_limit=1 means single use (one-time link)
+                    invite = bot.create_chat_invite_link(
+                        chat_id=channel_id,
+                        member_limit=1,  # Single use - one-time link
+                        expire_date=expire_date  # Expires 1 day from now
+                    )
                     invite_link = invite.invite_link
                 except Exception as e:
                     print("Invite link error:", e)
@@ -1444,7 +1493,16 @@ def handle_successful_payment(message: telebot.types.Message):
     invite_link = None
     if channel:
         try:
-            invite = bot.create_chat_invite_link(chat_id=channel, member_limit=1, expire_date=None)
+            # Set expire_date to 1 day from now
+            expire_date = datetime.datetime.now() + datetime.timedelta(days=1)
+            
+            # Create invite link with appropriate parameters
+            # member_limit=1 means single use (one-time link)
+            invite = bot.create_chat_invite_link(
+                chat_id=channel,
+                member_limit=1,  # Single use - one-time link
+                expire_date=expire_date  # Expires 1 day from now
+            )
             invite_link = invite.invite_link
         except Exception as e:
             print(f"create_chat_invite_link failed for {channel}:", e)
