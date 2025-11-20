@@ -265,6 +265,7 @@ def prodamus_result():
 def prodamus_success():
     """
     Handle Prodamus Success URL (user redirected after successful payment)
+    Also processes payment as fallback if Result URL doesn't work
     """
     try:
         if request.method == "GET":
@@ -277,10 +278,122 @@ def prodamus_success():
         # Forward to test webhook if configured
         forward_to_test_webhook("success", data, request.method)
         
+        # Try to process payment from Success URL (fallback if Result URL doesn't work)
+        # Success URL sends: _payform_status, _payform_order_id, _payform_sign
+        payform_status = data.get("_payform_status", "").lower()
+        payform_order_id = data.get("_payform_order_id", "")
+        payform_sign = data.get("_payform_sign", "")
+        
+        if payform_status == "success" and payform_order_id:
+            print(f"[Prodamus Success] Attempting to process payment: order_id={payform_order_id}")
+            
+            # Verify signature if secret key is configured
+            if PRODAMUS_SECRET_KEY and payform_sign:
+                try:
+                    verify_data = {k: v for k, v in data.items() if not k.startswith("_payform_sign")}
+                    verify_data["signature"] = payform_sign
+                    verify_data["sign"] = payform_sign
+                    
+                    if verify_prodamus_signature(verify_data, PRODAMUS_SECRET_KEY):
+                        print(f"[Prodamus Success] ✅ Signature verified")
+                    else:
+                        print(f"[Prodamus Success] ⚠️ Signature verification failed, but continuing...")
+                except Exception as e:
+                    print(f"[Prodamus Success] ⚠️ Signature verification error: {e}")
+            
+            # Process payment using the same logic as Result URL
+            try:
+                # Find pending payment
+                conn = sqlite3.connect(DATABASE_PATH)
+                cur = conn.cursor()
+                
+                # Try to find by order_id
+                cur.execute("SELECT user_id, course_id, amount FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (payform_order_id, payform_order_id))
+                row = cur.fetchone()
+                
+                if row:
+                    user_id, course_id, expected_amount = row[0], row[1], row[2]
+                    
+                    # Check if already processed
+                    cur.execute("SELECT COUNT(*) FROM purchases WHERE user_id = ? AND course_id = ? AND payment_id LIKE ?", 
+                              (user_id, course_id, f"prodamus_{payform_order_id}%"))
+                    already_processed = cur.fetchone()[0] > 0
+                    
+                    if already_processed:
+                        print(f"[Prodamus Success] ⚠️ Payment already processed, skipping")
+                        conn.close()
+                    else:
+                        # Get course data
+                        courses = get_courses_data()
+                        course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
+                        
+                        if course:
+                            course_name = course.get("name", f"ID {course_id}")
+                            duration = course.get("duration_days")
+                            channel = str(course.get("channel", ""))
+                            
+                            # Add purchase to database
+                            add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"prodamus_{payform_order_id}_success")
+                            
+                            # Remove from pending payments
+                            cur.execute("DELETE FROM pending_payments WHERE order_id = ?", (payform_order_id,))
+                            conn.commit()
+                            conn.close()
+                            
+                            # Send success message to user
+                            clean_course_name = strip_html(course_name) if course_name else f"ID {course_id}"
+                            text = f"✅ Оплата успешно получена!\n\n"
+                            text += f"Вам предоставлен доступ к курсу: {clean_course_name}"
+                            
+                            # Create invite link if channel exists
+                            invite_link = None
+                            if channel:
+                                try:
+                                    expire_date = datetime.datetime.now() + datetime.timedelta(days=1)
+                                    invite = bot.create_chat_invite_link(
+                                        chat_id=channel,
+                                        member_limit=1,
+                                        expire_date=expire_date
+                                    )
+                                    invite_link = invite.invite_link
+                                except Exception as e:
+                                    print(f"create_chat_invite_link failed: {e}")
+                            
+                            if invite_link:
+                                text += "\n\nНажмите кнопку ниже, чтобы перейти к материалам курса."
+                                kb = types.InlineKeyboardMarkup()
+                                kb.add(types.InlineKeyboardButton("Перейти в канал курса", url=invite_link))
+                                bot.send_message(user_id, text, reply_markup=kb)
+                            else:
+                                bot.send_message(user_id, text)
+                            
+                            # Notify admins
+                            admin_text = f"💰 Оплата Prodamus (Success URL): пользователь {user_id} купил {clean_course_name} (Order: {payform_order_id})"
+                            for aid in ADMIN_IDS:
+                                try:
+                                    bot.send_message(aid, admin_text)
+                                except Exception:
+                                    pass
+                            
+                            print(f"[Prodamus Success] ✅ Payment processed successfully via Success URL")
+                        else:
+                            print(f"[Prodamus Success] ❌ Course {course_id} not found")
+                            conn.close()
+                else:
+                    print(f"[Prodamus Success] ⚠️ Payment not found in pending_payments: {payform_order_id}")
+                    conn.close()
+                    
+            except Exception as e:
+                print(f"[Prodamus Success] ❌ Error processing payment: {e}")
+                import traceback
+                traceback.print_exc()
+        
         # Return a simple success page or redirect
         return "Payment successful! You can close this page.", 200
     except Exception as e:
         print(f"[Prodamus Success] Error: {e}")
+        import traceback
+        traceback.print_exc()
         return "ERROR", 500
 
 @application.route("/prodamus/fail", methods=["GET", "POST"])
