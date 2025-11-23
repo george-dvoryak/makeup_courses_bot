@@ -446,6 +446,16 @@ def strip_html(text: str) -> str:
         return ""
     return re.sub(r'<[^>]+>', '', str(text))
 
+def escape_html(text: str) -> str:
+    """Escape HTML special characters for safe use in HTML markup"""
+    if not text:
+        return ""
+    text = str(text)
+    text = text.replace('&', '&amp;')
+    text = text.replace('<', '&lt;')
+    text = text.replace('>', '&gt;')
+    return text
+
 def clean_html_text(text: str) -> str:
     """Clean text that might have HTML - remove tags but keep content"""
     if not text:
@@ -455,6 +465,53 @@ def clean_html_text(text: str) -> str:
     # Decode common HTML entities if any
     text = text.replace('&nbsp;', ' ').replace('&amp;', '&').replace('&lt;', '<').replace('&gt;', '>')
     return text.strip()
+
+def format_text_for_telegram(text: str) -> str:
+    """
+    Format text for Telegram HTML parse mode.
+    Converts Google Sheets formatting to Telegram HTML:
+    - Preserves bold, italic, underline, strikethrough, code, pre tags
+    - Escapes special characters (<, >, &) that are not part of valid HTML tags
+    - Preserves line breaks and list formatting
+    """
+    if not text:
+        return ""
+    
+    text = str(text)
+    
+    # Telegram supports these HTML tags: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">
+    # Also supports: <strong>, </strong>, <em>, </em>, <del>, </del>
+    
+    # First, protect valid HTML tags by replacing them with placeholders
+    protected_tags = []
+    # Pattern for opening tags with attributes (like <a href="...">)
+    opening_tag_pattern = r'<(b|strong|i|em|u|s|del|code|pre|a\s+href=["\'][^"\']*["\'])>'
+    # Pattern for closing tags (like </a>, </b>, etc.)
+    closing_tag_pattern = r'</(a|b|strong|i|em|u|s|del|code|pre)>'
+    
+    def protect_tag(match):
+        tag = match.group(0)
+        placeholder = f"__PROTECTED_TAG_{len(protected_tags)}__"
+        protected_tags.append(tag)
+        return placeholder
+    
+    # Protect opening tags with attributes
+    text = re.sub(opening_tag_pattern, protect_tag, text, flags=re.IGNORECASE)
+    # Protect closing tags
+    text = re.sub(closing_tag_pattern, protect_tag, text, flags=re.IGNORECASE)
+    
+    # Escape all remaining < and >
+    text = text.replace('<', '&lt;').replace('>', '&gt;')
+    
+    # Restore protected tags
+    for i, tag in enumerate(protected_tags):
+        text = text.replace(f"__PROTECTED_TAG_{i}__", tag)
+    
+    # Escape & that is not part of HTML entity (like &amp;, &lt;, &gt;, etc.)
+    # This regex matches & that is NOT followed by letters/digits/# and then ;
+    text = re.sub(r'&(?!([a-zA-Z0-9]+|#\d+);)', '&amp;', text)
+    
+    return text
 
 # Prodamus payment integration
 def generate_prodamus_signature(data: dict, secret_key: str) -> str:
@@ -1158,12 +1215,15 @@ def cb_course(c: telebot.types.CallbackQuery):
     image_url = course.get("image_url", "")
     channel_id = course.get("channel", "")
 
-    # Strip all HTML from course name - display as plain text only
-    formatted_name = strip_html(name) if name else "Курс"
+    # Strip all HTML from course name and escape HTML special characters for safe use in HTML markup
+    formatted_name = escape_html(strip_html(name)) if name else "Курс"
 
     if has_active_subscription(user_id, str(course_id)):
-        clean_desc = strip_html(desc) if desc else ""
-        text = f"{formatted_name}\n{clean_desc}\n\n✅ {ALREADY_PURCHASED_MSG}"
+        # Format description with HTML support for Telegram
+        formatted_desc = format_text_for_telegram(desc) if desc else ""
+        # Escape ALREADY_PURCHASED_MSG for safe use in HTML markup
+        escaped_msg = escape_html(ALREADY_PURCHASED_MSG)
+        text = f"<b>{formatted_name}</b>\n{formatted_desc}\n\n✅ {escaped_msg}"
         ikb = types.InlineKeyboardMarkup()
         if channel_id:
             if str(channel_id).startswith("@"):
@@ -1190,22 +1250,23 @@ def cb_course(c: telebot.types.CallbackQuery):
         ikb.add(types.InlineKeyboardButton("⬅️ Назад к каталогу", callback_data="back_to_catalog"))
         try:
             if c.message.content_type == "photo":
-                bot.edit_message_caption(chat_id=c.message.chat.id, message_id=c.message.message_id, caption=text, reply_markup=ikb)
+                bot.edit_message_caption(chat_id=c.message.chat.id, message_id=c.message.message_id, caption=text, reply_markup=ikb, parse_mode='HTML')
             else:
-                bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb)
+                bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb, parse_mode='HTML')
         except Exception:
-            bot.send_message(user_id, text, reply_markup=ikb)
+            bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
         bot.answer_callback_query(c.id)
         return
 
-    # Strip HTML from description too
-    clean_desc = strip_html(desc) if desc else ""
+    # Format description with HTML support for Telegram
+    formatted_desc = format_text_for_telegram(desc) if desc else ""
     # Format duration: None/0 = unlimited, otherwise show days
     if duration is None or duration == 0:
         duration_text = "бессрочно"
     else:
         duration_text = f"{duration} дн." if duration == 1 else f"{duration} дн."
-    text = f"{formatted_name}\n{clean_desc}\n\nЦена: {price} руб.\nДоступ: {duration_text}"
+    # formatted_name is already escaped above
+    text = f"<b>{formatted_name}</b>\n{formatted_desc}\n\nЦена: {price} руб.\nДоступ: {duration_text}"
     ikb = types.InlineKeyboardMarkup()
     # Add payment buttons
     if ENABLE_PRODAMUS and PRODAMUS_SECRET_KEY:
@@ -1228,7 +1289,7 @@ def cb_course(c: telebot.types.CallbackQuery):
                     bot.edit_message_media(
                         chat_id=c.message.chat.id,
                         message_id=c.message.message_id,
-                        media=types.InputMediaPhoto(image_url, caption=text),
+                        media=types.InputMediaPhoto(image_url, caption=text, parse_mode='HTML'),
                         reply_markup=ikb
                     )
                     bot.answer_callback_query(c.id)
@@ -1241,30 +1302,30 @@ def cb_course(c: telebot.types.CallbackQuery):
                     except Exception:
                         pass
             # Send new photo (either because original wasn't photo, or edit/delete failed)
-            bot.send_photo(user_id, image_url, caption=text, reply_markup=ikb)
+            bot.send_photo(user_id, image_url, caption=text, reply_markup=ikb, parse_mode='HTML')
             message_sent = True
         else:
             # No course image - edit text or send new message
             if c.message.content_type == "photo":
                 # Original was photo, but course has no image - send text message
-                bot.send_message(user_id, text, reply_markup=ikb)
+                bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
                 message_sent = True
             else:
                 # Original was text - can edit
                 try:
-                    bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb)
+                    bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb, parse_mode='HTML')
                     message_sent = True
                 except Exception as e:
                     print(f"Failed to edit message text: {e}")
                     # If edit fails, send new message
-                    bot.send_message(user_id, text, reply_markup=ikb)
+                    bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
                     message_sent = True
         bot.answer_callback_query(c.id)
     except Exception as e:
         # Fallback: send text message if everything else fails (only if we haven't sent anything yet)
         print(f"Error in course handler: {e}")
         if not message_sent:
-            bot.send_message(user_id, text, reply_markup=ikb)
+            bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
         bot.answer_callback_query(c.id)
 
 @bot.callback_query_handler(func=lambda c: c.data == "back_to_catalog")
