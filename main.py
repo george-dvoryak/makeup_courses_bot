@@ -13,7 +13,7 @@ from flask import Flask, request, abort
 import requests
 
 from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, ENABLE_PRODAMUS, PRODAMUS_PAYFORM_URL, PRODAMUS_SECRET_KEY, PRODAMUS_TEST_MODE, PRODAMUS_SYSTEM_ID, PRODAMUS_TEST_WEBHOOK_URL
-from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions
+from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions, clear_all_data
 from google_sheets import get_courses_data, get_texts_data
 
 
@@ -1829,6 +1829,123 @@ def handle_cleanup_expired(message: telebot.types.Message):
         bot.reply_to(message, f"❌ Ошибка при очистке: {e}")
         import traceback
         print(f"Cleanup error: {traceback.format_exc()}")
+
+# In-memory state for database clearing confirmation
+# Format: {user_id: True} - user has confirmed they want to clear DB
+db_clear_confirmations = {}
+
+@bot.message_handler(commands=['clear_db'])
+def handle_clear_db(message: telebot.types.Message):
+    """Admin command to clear all database data"""
+    user_id = message.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.reply_to(message, "❌ У вас нет доступа к этой команде.")
+        return
+    
+    # Check if user already confirmed
+    if user_id in db_clear_confirmations:
+        # User confirmed, proceed with clearing
+        del db_clear_confirmations[user_id]
+        
+        try:
+            # Get statistics before clearing
+            stats = clear_all_data()
+            
+            # Build report
+            report = "🗑️ <b>База данных полностью очищена!</b>\n\n"
+            report += "📊 Удалено:\n"
+            report += f"• Пользователей: {stats['users']}\n"
+            report += f"• Покупок: {stats['purchases']}\n"
+            report += f"• Ожидающих платежей: {stats['pending_payments']}\n\n"
+            report += "✅ База данных теперь пуста."
+            
+            bot.reply_to(message, report, parse_mode='HTML')
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка при очистке базы данных: {e}")
+    else:
+        # First time - show warning and ask for confirmation
+        try:
+            # Get current statistics
+            from db import get_connection
+            conn = get_connection()
+            cur = conn.cursor()
+            
+            cur.execute("SELECT COUNT(*) FROM users")
+            users_count = cur.fetchone()[0]
+            
+            cur.execute("SELECT COUNT(*) FROM purchases")
+            purchases_count = cur.fetchone()[0]
+            
+            try:
+                cur.execute("SELECT COUNT(*) FROM pending_payments")
+                pending_count = cur.fetchone()[0]
+            except sqlite3.OperationalError:
+                pending_count = 0
+            
+            warning = "⚠️ <b>ВНИМАНИЕ!</b>\n\n"
+            warning += "Вы собираетесь <b>полностью очистить базу данных</b>.\n\n"
+            warning += "📊 Текущая статистика:\n"
+            warning += f"• Пользователей: {users_count}\n"
+            warning += f"• Покупок: {purchases_count}\n"
+            warning += f"• Ожидающих платежей: {pending_count}\n\n"
+            warning += "❌ Это действие <b>необратимо</b>!\n"
+            warning += "Все данные будут удалены навсегда.\n\n"
+            warning += "Нажмите кнопку ниже для подтверждения:"
+            
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("✅ Да, очистить базу данных", callback_data="confirm_clear_db"))
+            kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_clear_db"))
+            
+            bot.reply_to(message, warning, reply_markup=kb, parse_mode='HTML')
+        except Exception as e:
+            bot.reply_to(message, f"❌ Ошибка при получении статистики: {e}")
+
+@bot.callback_query_handler(func=lambda c: c.data == "confirm_clear_db")
+def cb_confirm_clear_db(c: telebot.types.CallbackQuery):
+    """Handle confirmation to clear database"""
+    user_id = c.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.answer_callback_query(c.id, "❌ У вас нет доступа.", show_alert=True)
+        return
+    
+    # Mark user as confirmed
+    db_clear_confirmations[user_id] = True
+    
+    # Edit message to show confirmation
+    try:
+        bot.edit_message_text(
+            "✅ Подтверждение получено. Отправьте команду /clear_db еще раз для выполнения очистки.",
+            chat_id=c.message.chat.id,
+            message_id=c.message.message_id
+        )
+    except Exception:
+        pass
+    
+    bot.answer_callback_query(c.id, "Подтверждение получено. Отправьте /clear_db еще раз.")
+
+@bot.callback_query_handler(func=lambda c: c.data == "cancel_clear_db")
+def cb_cancel_clear_db(c: telebot.types.CallbackQuery):
+    """Handle cancellation of database clearing"""
+    user_id = c.from_user.id
+    if user_id not in ADMIN_IDS:
+        bot.answer_callback_query(c.id, "❌ У вас нет доступа.", show_alert=True)
+        return
+    
+    # Remove from confirmations if exists
+    if user_id in db_clear_confirmations:
+        del db_clear_confirmations[user_id]
+    
+    # Edit message to show cancellation
+    try:
+        bot.edit_message_text(
+            "❌ Очистка базы данных отменена.",
+            chat_id=c.message.chat.id,
+            message_id=c.message.message_id
+        )
+    except Exception:
+        pass
+    
+    bot.answer_callback_query(c.id, "Очистка отменена.")
 
 @bot.message_handler(commands=['broadcast_all', 'broadcast_buyers', 'broadcast_nonbuyers'])
 def handle_broadcast(message: telebot.types.Message):

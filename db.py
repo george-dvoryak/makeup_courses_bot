@@ -164,3 +164,44 @@ def get_all_active_subscriptions():
         (now,)
     )
     return cur.fetchall()
+
+def clear_all_data():
+    """
+    Clear all data from database tables.
+    WARNING: This will delete ALL users, purchases, and pending payments!
+    Returns statistics about what was deleted.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    
+    # Get statistics before deletion
+    stats = {}
+    
+    # Count users
+    cur.execute("SELECT COUNT(*) FROM users")
+    stats['users'] = cur.fetchone()[0]
+    
+    # Count purchases
+    cur.execute("SELECT COUNT(*) FROM purchases")
+    stats['purchases'] = cur.fetchone()[0]
+    
+    # Count pending payments (table might not exist)
+    try:
+        cur.execute("SELECT COUNT(*) FROM pending_payments")
+        stats['pending_payments'] = cur.fetchone()[0]
+    except sqlite3.OperationalError:
+        stats['pending_payments'] = 0
+    
+    # Delete all data
+    cur.execute("DELETE FROM purchases")
+    cur.execute("DELETE FROM users")
+    
+    # Delete pending_payments if table exists
+    try:
+        cur.execute("DELETE FROM pending_payments")
+    except sqlite3.OperationalError:
+        pass  # Table doesn't exist, ignore
+    
+    conn.commit()
+    
+    return stats
