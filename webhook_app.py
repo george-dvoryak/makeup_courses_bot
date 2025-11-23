@@ -369,6 +369,10 @@ if ENABLE_PRODAMUS:
                     duration = course.get("duration_days")
                     channel = str(course.get("channel", ""))
                     
+                    # Ensure user exists in database before adding purchase (FOREIGN KEY constraint)
+                    from db import add_user
+                    add_user(user_id, None)
+                    
                     # Add purchase to database
                     expiry_ts = add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"prodamus_{order_number}")
                     
@@ -533,6 +537,10 @@ if ENABLE_PRODAMUS:
                                 course_name = course.get("name", f"ID {course_id}")
                                 duration = course.get("duration_days")
                                 channel = str(course.get("channel", ""))
+                                
+                                # Ensure user exists in database before adding purchase (FOREIGN KEY constraint)
+                                from db import add_user
+                                add_user(user_id, None)
                                 
                                 # Add purchase to database
                                 add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"prodamus_{payform_order_id}_success")

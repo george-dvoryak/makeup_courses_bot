@@ -198,6 +198,9 @@ def prodamus_result():
                 duration = course.get("duration_days")  # None if unlimited, int if limited
                 channel = str(course.get("channel", ""))
                 
+                # Ensure user exists in database before adding purchase (FOREIGN KEY constraint)
+                add_user(user_id, None)
+                
                 # Add purchase to database
                 expiry_ts = add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"prodamus_{order_number}")
                 
@@ -331,6 +334,9 @@ def prodamus_success():
                             course_name = course.get("name", f"ID {course_id}")
                             duration = course.get("duration_days")
                             channel = str(course.get("channel", ""))
+                            
+                            # Ensure user exists in database before adding purchase (FOREIGN KEY constraint)
+                            add_user(user_id, None)
                             
                             # Add purchase to database
                             add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"prodamus_{payform_order_id}_success")
@@ -1682,6 +1688,10 @@ def handle_successful_payment(message: telebot.types.Message):
     course_name = course.get("name", f"ID {course_id}") if course else f"ID {course_id}"
     duration = course.get("duration_days") if course else None  # None if unlimited
     channel = str(course.get("channel", "")) if course else ""
+
+    # Ensure user exists in database before adding purchase (FOREIGN KEY constraint)
+    username = message.from_user.username if message.from_user.username else None
+    add_user(user_id, username)
 
     expiry_ts = add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=payment.telegram_payment_charge_id)
 
