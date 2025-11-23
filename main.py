@@ -12,20 +12,78 @@ from urllib.parse import urlencode, quote
 from flask import Flask, request, abort
 import requests
 
-from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, ENABLE_PRODAMUS, PRODAMUS_PAYFORM_URL, PRODAMUS_SECRET_KEY, PRODAMUS_TEST_MODE, PRODAMUS_SYSTEM_ID, PRODAMUS_TEST_WEBHOOK_URL
+from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, ENABLE_PRODAMUS, PRODAMUS_PAYFORM_URL, PRODAMUS_SECRET_KEY, PRODAMUS_TEST_MODE, PRODAMUS_SYSTEM_ID, PRODAMUS_TEST_WEBHOOK_URL, get_bot_config, CURRENT_BOT_NAME
 from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions, clear_all_data
 from google_sheets import get_courses_data, get_texts_data
+from bot_context import get_bot_context
+from bot_factory import get_bot_instance
 
-
+# Create default bot instance (for backward compatibility)
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=False)
 
-# In-memory state for Prodamus email collection
-# Format: {user_id: {"course_id": course_id, "order_id": order_id, "price": price, "name": name}}
+# Helper function to get the current bot instance
+def get_current_bot():
+    """
+    Get the current bot instance based on context.
+    Falls back to default bot if no context is set.
+    """
+    bot_name = get_bot_context()
+    if bot_name:
+        try:
+            return get_bot_instance(bot_name)
+        except Exception:
+            pass
+    return bot
+
+# Helper function to get current bot config
+def get_current_config():
+    """Get current bot configuration based on context"""
+    bot_name = get_bot_context() or CURRENT_BOT_NAME
+    return get_bot_config(bot_name)
+
+# Helper function to get current admin IDs
+def get_current_admin_ids():
+    """Get current bot's admin IDs"""
+    config = get_current_config()
+    return config.get('get_current_admin_ids()', get_current_admin_ids())
+
+# Helper function to get current payment config
+def get_current_payment_config():
+    """Get current bot's payment configuration"""
+    config = get_current_config()
+    return {
+        'PAYMENT_PROVIDER_TOKEN': config.get('PAYMENT_PROVIDER_TOKEN', PAYMENT_PROVIDER_TOKEN),
+        'CURRENCY': config.get('CURRENCY', CURRENCY),
+        'ENABLE_PRODAMUS': config.get('ENABLE_PRODAMUS', ENABLE_PRODAMUS),
+        'PRODAMUS_PAYFORM_URL': config.get('PRODAMUS_PAYFORM_URL', PRODAMUS_PAYFORM_URL),
+        'PRODAMUS_SECRET_KEY': config.get('PRODAMUS_SECRET_KEY', PRODAMUS_SECRET_KEY),
+        'PRODAMUS_TEST_MODE': config.get('PRODAMUS_TEST_MODE', PRODAMUS_TEST_MODE),
+        'PRODAMUS_SYSTEM_ID': config.get('PRODAMUS_SYSTEM_ID', PRODAMUS_SYSTEM_ID),
+        'PRODAMUS_TEST_WEBHOOK_URL': config.get('PRODAMUS_TEST_WEBHOOK_URL', PRODAMUS_TEST_WEBHOOK_URL)
+    }
+
+# In-memory state for Prodamus email collection (per bot)
+# Format: {bot_name: {user_id: {"course_id": course_id, "order_id": order_id, "price": price, "name": name}}}
 prodamus_pending_emails = {}
 
-# In-memory state for admin broadcast
-# Format: {user_id: {"type": "all"/"buyers"/"nonbuyers", "text": "...", "photo": file_id or None}}
+# In-memory state for admin broadcast (per bot)
+# Format: {bot_name: {user_id: {"type": "all"/"buyers"/"nonbuyers", "text": "...", "photo": file_id or None}}}
 admin_broadcast_state = {}
+
+# Helper to get bot-specific state
+def get_prodamus_pending_emails():
+    """Get Prodamus pending emails for current bot"""
+    bot_name = get_bot_context() or CURRENT_BOT_NAME
+    if bot_name not in prodamus_pending_emails:
+        prodamus_pending_emails[bot_name] = {}
+    return prodamus_pending_emails[bot_name]
+
+def get_admin_broadcast_state():
+    """Get admin broadcast state for current bot"""
+    bot_name = get_bot_context() or CURRENT_BOT_NAME
+    if bot_name not in admin_broadcast_state:
+        admin_broadcast_state[bot_name] = {}
+    return admin_broadcast_state[bot_name]
 
 # --- Webhook / WSGI (PythonAnywhere) support ---
 # Import webhook config from config.py (already processed and normalized)
@@ -54,13 +112,14 @@ webhook_route = WEBHOOK_PATH if WEBHOOK_PATH else f"/{TELEGRAM_BOT_TOKEN}"
 @application.post(webhook_route)
 def _webhook():
     # Validate Telegram secret header if configured
+    current_bot = get_current_bot()
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
     if WEBHOOK_SECRET_TOKEN and secret != WEBHOOK_SECRET_TOKEN:
         abort(403)
     # Forward the update to pyTelegramBotAPI
     try:
         update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-        bot.process_new_updates([update])
+        current_bot.process_new_updates([update])
     except Exception as e:
         print(f"Error processing webhook update: {e}")
     return "OK", 200
@@ -77,7 +136,7 @@ def _diag():
 # Helper function to forward webhook data to test URL
 def forward_to_test_webhook(endpoint_name: str, data: dict, method: str = "GET"):
     """Forward webhook data to test webhook URL (e.g., webhook.site) for debugging"""
-    if not PRODAMUS_TEST_WEBHOOK_URL:
+    if not get_current_payment_config()['PRODAMUS_TEST_WEBHOOK_URL']:
         return
     
     try:
@@ -87,7 +146,7 @@ def forward_to_test_webhook(endpoint_name: str, data: dict, method: str = "GET")
             "data": data,
             "timestamp": time.time()
         }
-        requests.post(PRODAMUS_TEST_WEBHOOK_URL, json=test_data, timeout=5)
+        requests.post(get_current_payment_config()['PRODAMUS_TEST_WEBHOOK_URL'], json=test_data, timeout=5)
         print(f"[Prodamus Test] Forwarded {endpoint_name} data to test webhook")
     except Exception as e:
         print(f"[Prodamus Test] Failed to forward to test webhook: {e}")
@@ -95,6 +154,7 @@ def forward_to_test_webhook(endpoint_name: str, data: dict, method: str = "GET")
 # Prodamus webhook handlers (Success/Fail/Result URLs)
 @application.route("/prodamus/result", methods=["GET", "POST"])
 def prodamus_result():
+    current_bot = get_current_bot()
     """
     Handle Prodamus Result URL notification (payment status update)
     This endpoint receives payment notifications from Prodamus
@@ -119,8 +179,8 @@ def prodamus_result():
         forward_to_test_webhook("result", data, request.method)
         
         # Verify signature if secret key is configured
-        if PRODAMUS_SECRET_KEY:
-            if not verify_prodamus_signature(data, PRODAMUS_SECRET_KEY):
+        if get_current_payment_config()['PRODAMUS_SECRET_KEY']:
+            if not verify_prodamus_signature(data, get_current_payment_config()['PRODAMUS_SECRET_KEY']):
                 print(f"[Prodamus Result] Invalid signature")
                 return "ERROR: Invalid signature", 400
         
@@ -143,7 +203,7 @@ def prodamus_result():
         
         # Find pending payment in database
         try:
-            conn = sqlite3.connect(DATABASE_PATH)
+            conn = sqlite3.connect(get_current_config()['DATABASE_PATH'])
             cur = conn.cursor()
             # Create pending_payments table if not exists
             cur.execute("""
@@ -223,7 +283,7 @@ def prodamus_result():
                         
                         # Create invite link with appropriate parameters
                         # member_limit=1 means single use (one-time link)
-                        invite = bot.create_chat_invite_link(
+                        invite = current_bot.create_chat_invite_link(
                             chat_id=channel,
                             member_limit=1,  # Single use - one-time link
                             expire_date=expire_date  # Expires 1 day after purchase
@@ -236,15 +296,15 @@ def prodamus_result():
                     text += "\n\nНажмите кнопку ниже, чтобы перейти к материалам курса."
                     kb = types.InlineKeyboardMarkup()
                     kb.add(types.InlineKeyboardButton("Перейти в канал курса", url=invite_link))
-                    bot.send_message(user_id, text, reply_markup=kb)
+                    current_bot.send_message(user_id, text, reply_markup=kb)
                 else:
-                    bot.send_message(user_id, text)
+                    current_bot.send_message(user_id, text)
                 
                 # Notify admins
                 admin_text = f"💰 Оплата Prodamus: пользователь {user_id} купил {clean_course_name} на сумму {amount} руб. (Order: {order_number})"
-                for aid in ADMIN_IDS:
+                for aid in get_current_admin_ids():
                     try:
-                        bot.send_message(aid, admin_text)
+                        current_bot.send_message(aid, admin_text)
                     except Exception:
                         pass
                 
@@ -266,6 +326,7 @@ def prodamus_result():
 
 @application.route("/prodamus/success", methods=["GET", "POST"])
 def prodamus_success():
+    current_bot = get_current_bot()
     """
     Handle Prodamus Success URL (user redirected after successful payment)
     Also processes payment as fallback if Result URL doesn't work
@@ -291,13 +352,13 @@ def prodamus_success():
             print(f"[Prodamus Success] Attempting to process payment: order_id={payform_order_id}")
             
             # Verify signature if secret key is configured
-            if PRODAMUS_SECRET_KEY and payform_sign:
+            if get_current_payment_config()['PRODAMUS_SECRET_KEY'] and payform_sign:
                 try:
                     verify_data = {k: v for k, v in data.items() if not k.startswith("_payform_sign")}
                     verify_data["signature"] = payform_sign
                     verify_data["sign"] = payform_sign
                     
-                    if verify_prodamus_signature(verify_data, PRODAMUS_SECRET_KEY):
+                    if verify_prodamus_signature(verify_data, get_current_payment_config()['PRODAMUS_SECRET_KEY']):
                         print(f"[Prodamus Success] ✅ Signature verified")
                     else:
                         print(f"[Prodamus Success] ⚠️ Signature verification failed, but continuing...")
@@ -307,7 +368,7 @@ def prodamus_success():
             # Process payment using the same logic as Result URL
             try:
                 # Find pending payment
-                conn = sqlite3.connect(DATABASE_PATH)
+                conn = sqlite3.connect(get_current_config()['DATABASE_PATH'])
                 cur = conn.cursor()
                 
                 # Try to find by order_id
@@ -356,7 +417,7 @@ def prodamus_success():
                             if channel:
                                 try:
                                     expire_date = datetime.datetime.now() + datetime.timedelta(days=1)
-                                    invite = bot.create_chat_invite_link(
+                                    invite = current_bot.create_chat_invite_link(
                                         chat_id=channel,
                                         member_limit=1,
                                         expire_date=expire_date
@@ -369,15 +430,15 @@ def prodamus_success():
                                 text += "\n\nНажмите кнопку ниже, чтобы перейти к материалам курса."
                                 kb = types.InlineKeyboardMarkup()
                                 kb.add(types.InlineKeyboardButton("Перейти в канал курса", url=invite_link))
-                                bot.send_message(user_id, text, reply_markup=kb)
+                                current_bot.send_message(user_id, text, reply_markup=kb)
                             else:
-                                bot.send_message(user_id, text)
+                                current_bot.send_message(user_id, text)
                             
                             # Notify admins
                             admin_text = f"💰 Оплата Prodamus (Success URL): пользователь {user_id} купил {clean_course_name} (Order: {payform_order_id})"
-                            for aid in ADMIN_IDS:
+                            for aid in get_current_admin_ids():
                                 try:
-                                    bot.send_message(aid, admin_text)
+                                    current_bot.send_message(aid, admin_text)
                                 except Exception:
                                     pass
                             
@@ -548,7 +609,7 @@ def verify_prodamus_signature(data: dict, secret_key: str) -> bool:
     received_signature = received_signature.lower()
     calculated_signature = generate_prodamus_signature(data, secret_key).lower()
     
-    if PRODAMUS_TEST_MODE:
+    if get_current_payment_config()['PRODAMUS_TEST_MODE']:
         print(f"[Prodamus] Signature verification: received={received_signature[:20]}..., calculated={calculated_signature[:20]}...")
     
     return received_signature == calculated_signature
@@ -564,10 +625,10 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
     """
     try:
         # Build API URL
-        if PRODAMUS_TEST_MODE:
-            api_url = f"https://{PRODAMUS_PAYFORM_URL}/"
+        if get_current_payment_config()['PRODAMUS_TEST_MODE']:
+            api_url = f"https://{get_current_payment_config()['PRODAMUS_PAYFORM_URL']}/"
         else:
-            api_url = f"https://{PRODAMUS_PAYFORM_URL}/"
+            api_url = f"https://{get_current_payment_config()['PRODAMUS_PAYFORM_URL']}/"
         
         # Prepare request data according to Prodamus API
         # For personal payment link, we need: products, order_id, customerEmail or customerPhone
@@ -580,8 +641,8 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
         }
         
         # Add system ID if configured
-        if PRODAMUS_SYSTEM_ID:
-            data["sys"] = PRODAMUS_SYSTEM_ID
+        if get_current_payment_config()['PRODAMUS_SYSTEM_ID']:
+            data["sys"] = get_current_payment_config()['PRODAMUS_SYSTEM_ID']
         
         # For personal link, at least one contact is required
         if customer_email:
@@ -594,7 +655,7 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
         if not customer_email and not customer_phone:
             data["customerEmail"] = "customer@example.com"  # Placeholder
         
-        if PRODAMUS_TEST_MODE:
+        if get_current_payment_config()['PRODAMUS_TEST_MODE']:
             print(f"[Prodamus] Creating invoice with data: {data}")
             print(f"[Prodamus] Request URL: {api_url}")
         
@@ -602,15 +663,15 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
         response = None
         try:
             response = requests.get(api_url, params=data, allow_redirects=True, timeout=15)
-            if PRODAMUS_TEST_MODE:
+            if get_current_payment_config()['PRODAMUS_TEST_MODE']:
                 print(f"[Prodamus] GET request successful, status: {response.status_code}")
         except Exception as e:
-            if PRODAMUS_TEST_MODE:
+            if get_current_payment_config()['PRODAMUS_TEST_MODE']:
                 print(f"[Prodamus] GET request failed: {e}, trying POST")
             # Fallback to POST
             try:
                 response = requests.post(api_url, data=data, allow_redirects=True, timeout=15)
-                if PRODAMUS_TEST_MODE:
+                if get_current_payment_config()['PRODAMUS_TEST_MODE']:
                     print(f"[Prodamus] POST request successful, status: {response.status_code}")
             except Exception as e2:
                 print(f"[Prodamus] Both GET and POST failed: {e2}")
@@ -624,7 +685,7 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
         
         # Try to extract from response text first (Prodamus returns short link in response text)
         response_text = response.text.strip()
-        if PRODAMUS_TEST_MODE:
+        if get_current_payment_config()['PRODAMUS_TEST_MODE']:
             print(f"[Prodamus] Final URL after redirects: {final_url}")
             print(f"[Prodamus] Response text (first 1000 chars): {response_text[:1000]}")
         
@@ -636,7 +697,7 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
             if "invoice_id=" in response_text:
                 invoice_id = response_text.split("invoice_id=")[1].split("&")[0].split("?")[0].split("#")[0].split("/")[0]
                 if invoice_id and len(invoice_id) > 10:
-                    if PRODAMUS_TEST_MODE:
+                    if get_current_payment_config()['PRODAMUS_TEST_MODE']:
                         print(f"[Prodamus] Extracted invoice_id from response URL: {invoice_id}")
                     return invoice_id
             # Try to extract short code from URL path
@@ -646,7 +707,7 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
             if match:
                 invoice_id = match.group(1)
                 if len(invoice_id) >= 6:  # Short codes are usually 6+ characters
-                    if PRODAMUS_TEST_MODE:
+                    if get_current_payment_config()['PRODAMUS_TEST_MODE']:
                         print(f"[Prodamus] Extracted invoice_id from short link: {invoice_id}")
                     return invoice_id
         
@@ -654,7 +715,7 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
         if "invoice_id=" in final_url:
             invoice_id = final_url.split("invoice_id=")[1].split("&")[0].split("?")[0].split("#")[0]
             if invoice_id and len(invoice_id) > 10:  # Basic validation
-                if PRODAMUS_TEST_MODE:
+                if get_current_payment_config()['PRODAMUS_TEST_MODE']:
                     print(f"[Prodamus] Extracted invoice_id from final URL: {invoice_id}")
                 return invoice_id
         
@@ -672,7 +733,7 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
             if match:
                 invoice_id = match.group(1)
                 if len(invoice_id) > 10:
-                    if PRODAMUS_TEST_MODE:
+                    if get_current_payment_config()['PRODAMUS_TEST_MODE']:
                         print(f"[Prodamus] Extracted invoice_id using pattern {pattern}: {invoice_id}")
                     return invoice_id
         
@@ -680,7 +741,7 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
         try:
             if response.headers.get("content-type", "").startswith("application/json"):
                 response_data = response.json()
-                if PRODAMUS_TEST_MODE:
+                if get_current_payment_config()['PRODAMUS_TEST_MODE']:
                     print(f"[Prodamus] JSON response: {response_data}")
                 if "invoice_id" in response_data:
                     return str(response_data["invoice_id"])
@@ -692,7 +753,7 @@ def create_prodamus_invoice(order_id: str, amount: float, product_name: str = ""
         except:
             pass
         
-        if PRODAMUS_TEST_MODE:
+        if get_current_payment_config()['PRODAMUS_TEST_MODE']:
             print(f"[Prodamus] Could not extract invoice_id. Final URL: {final_url}")
             print(f"[Prodamus] Response status: {response.status_code}")
         
@@ -721,10 +782,10 @@ def generate_prodamus_payment_url(order_number: str, amount: float, product_name
         Payment URL string
     """
     # Build base URL
-    if PRODAMUS_TEST_MODE:
-        base_url = f"https://{PRODAMUS_PAYFORM_URL}/?old_auth=1"
+    if get_current_payment_config()['PRODAMUS_TEST_MODE']:
+        base_url = f"https://{get_current_payment_config()['PRODAMUS_PAYFORM_URL']}/?old_auth=1"
     else:
-        base_url = f"https://{PRODAMUS_PAYFORM_URL}/"
+        base_url = f"https://{get_current_payment_config()['PRODAMUS_PAYFORM_URL']}/"
     
     params = {
         "do": "pay",
@@ -735,8 +796,8 @@ def generate_prodamus_payment_url(order_number: str, amount: float, product_name
         "order": order_number,
     }
     
-    if PRODAMUS_SYSTEM_ID:
-        params["sys"] = PRODAMUS_SYSTEM_ID
+    if get_current_payment_config()['PRODAMUS_SYSTEM_ID']:
+        params["sys"] = get_current_payment_config()['PRODAMUS_SYSTEM_ID']
     
     if customer_email:
         # Try multiple parameter names for email pre-filling
@@ -752,7 +813,7 @@ def generate_prodamus_payment_url(order_number: str, amount: float, product_name
     query_string = urlencode(params, doseq=True)
     full_url = f"{base_url}&{query_string}" if "?" in base_url else f"{base_url}?{query_string}"
     
-    if PRODAMUS_TEST_MODE:
+    if get_current_payment_config()['PRODAMUS_TEST_MODE']:
         print(f"[Prodamus] Generated payment URL (test mode): {full_url}")
     
     return full_url
@@ -786,8 +847,9 @@ def get_main_menu_keyboard(user_id: int) -> types.ReplyKeyboardMarkup:
     keyboard.add(btn_subs, btn_support)
     keyboard.add(btn_oferta)
     
-    # Add admin buttons if user is admin
-    if user_id in ADMIN_IDS:
+    # Add admin buttons if user is admin (use current bot's admin IDs)
+    admin_ids = get_current_admin_ids()
+    if user_id in admin_ids:
         btn_admin_subs = types.KeyboardButton("📊 Все подписки")
         btn_admin_sheets = types.KeyboardButton("📋 Google Sheets")
         btn_admin_broadcast = types.KeyboardButton("📢 Рассылка")
@@ -808,19 +870,23 @@ main_menu_keyboard.add(btn_oferta)
 
 @bot.message_handler(commands=['start'])
 def handle_start(message: telebot.types.Message):
+    current_bot = get_current_bot()
+    current_bot = get_current_bot()
     user_id = message.from_user.id
     username = message.from_user.username or ""
     add_user(user_id, username)
 
     # Use dynamic keyboard that includes admin buttons if user is admin
     keyboard = get_main_menu_keyboard(user_id)
+    texts = get_texts_data()
+    WELCOME_MSG = texts.get("welcome_message", "Здравствуйте! Этот бот поможет вам купить курсы по макияжу.\nНиже находится меню.")
     welcome_image_url = texts.get("welcome_image_url")
     
     # Try to send welcome message with photo if available
     message_sent = False
     if welcome_image_url:
         try:
-            bot.send_photo(user_id, welcome_image_url, caption=WELCOME_MSG, reply_markup=keyboard)
+            current_bot.send_photo(user_id, welcome_image_url, caption=WELCOME_MSG, reply_markup=keyboard)
             message_sent = True
         except Exception as e:
             error_msg = str(e).lower()
@@ -830,7 +896,7 @@ def handle_start(message: telebot.types.Message):
                 return
             # For other errors, try to send text message
             try:
-                bot.send_message(user_id, WELCOME_MSG, reply_markup=keyboard)
+                current_bot.send_message(user_id, WELCOME_MSG, reply_markup=keyboard)
                 message_sent = True
             except Exception as e2:
                 error_msg2 = str(e2).lower()
@@ -842,7 +908,7 @@ def handle_start(message: telebot.types.Message):
     # If no photo or photo send failed, send text message
     if not message_sent:
         try:
-            bot.send_message(user_id, WELCOME_MSG, reply_markup=keyboard)
+            current_bot.send_message(user_id, WELCOME_MSG, reply_markup=keyboard)
         except Exception as e:
             error_msg = str(e).lower()
             # If user blocked bot or chat not found, just log and return
@@ -852,18 +918,21 @@ def handle_start(message: telebot.types.Message):
             print(f"Failed to send welcome message to user {user_id}: {e}")
 
 def send_catalog_message(user_id, edit_message=None, edit_message_id=None, edit_chat_id=None):
+    current_bot = get_current_bot()
     """Helper function to send/update catalog message"""
+    current_bot = get_current_bot()
+    texts = get_texts_data()
     try:
         courses = get_courses_data()
     except Exception as e:
         error_msg = "Не удалось загрузить каталог курсов. Попробуйте позже."
         if edit_message:
             try:
-                bot.edit_message_text(error_msg, chat_id=edit_chat_id, message_id=edit_message_id)
+                current_bot.edit_message_text(error_msg, chat_id=edit_chat_id, message_id=edit_message_id)
             except Exception:
-                bot.send_message(user_id, error_msg)
+                current_bot.send_message(user_id, error_msg)
         else:
-            bot.send_message(user_id, error_msg)
+            current_bot.send_message(user_id, error_msg)
         print("Error fetching courses:", e)
         return
     
@@ -874,11 +943,11 @@ def send_catalog_message(user_id, edit_message=None, edit_message_id=None, edit_
         empty_msg = "Каталог пока пуст."
         if edit_message:
             try:
-                bot.edit_message_text(empty_msg, chat_id=edit_chat_id, message_id=edit_message_id)
+                current_bot.edit_message_text(empty_msg, chat_id=edit_chat_id, message_id=edit_message_id)
             except Exception:
-                bot.send_message(user_id, empty_msg)
+                current_bot.send_message(user_id, empty_msg)
         else:
-            bot.send_message(user_id, empty_msg)
+            current_bot.send_message(user_id, empty_msg)
         return
 
     kb = types.InlineKeyboardMarkup()
@@ -895,39 +964,42 @@ def send_catalog_message(user_id, edit_message=None, edit_message_id=None, edit_
         # When going back to catalog, always delete old message and send new one
         # This ensures the image updates correctly (can't change photo in existing message)
         try:
-            bot.delete_message(chat_id=edit_chat_id, message_id=edit_message_id)
+            current_bot.delete_message(chat_id=edit_chat_id, message_id=edit_message_id)
         except Exception:
             pass  # If deletion fails (e.g., message too old), continue anyway
         # Send new catalog message
         try:
             if banner:
-                bot.send_photo(user_id, banner, caption=caption, reply_markup=kb)
+                current_bot.send_photo(user_id, banner, caption=caption, reply_markup=kb)
             else:
-                bot.send_message(user_id, caption, reply_markup=kb)
+                current_bot.send_message(user_id, caption, reply_markup=kb)
         except Exception:
-            bot.send_message(user_id, caption, reply_markup=kb)
+            current_bot.send_message(user_id, caption, reply_markup=kb)
     else:
         # Send new message
         try:
             if banner:
-                bot.send_photo(user_id, banner, caption=caption, reply_markup=kb)
+                current_bot.send_photo(user_id, banner, caption=caption, reply_markup=kb)
             else:
-                bot.send_message(user_id, caption, reply_markup=kb)
+                current_bot.send_message(user_id, caption, reply_markup=kb)
         except Exception:
-            bot.send_message(user_id, caption, reply_markup=kb)
+            current_bot.send_message(user_id, caption, reply_markup=kb)
 
 @bot.message_handler(func=lambda m: m.text == "Каталог")
 def handle_catalog(message: telebot.types.Message):
+    current_bot = get_current_bot()
     user_id = message.from_user.id
     send_catalog_message(user_id)
 
 @bot.message_handler(func=lambda m: m.text == "Активные подписки")
 def handle_active(message: telebot.types.Message):
+    current_bot = get_current_bot()
+    current_bot = get_current_bot()
     user_id = message.from_user.id
     subs = get_active_subscriptions(user_id)
     subs = list(subs) if subs else []
     if not subs:
-        bot.send_message(user_id, "У вас нет активных подписок.")
+        current_bot.send_message(user_id, "У вас нет активных подписок.")
         return
     
     text = "Ваши активные подписки:\n\n"
@@ -962,7 +1034,7 @@ def handle_active(message: telebot.types.Message):
                     
                     # Create invite link with appropriate parameters
                     # member_limit=1 means single use (one-time link)
-                    invite = bot.create_chat_invite_link(
+                    invite = current_bot.create_chat_invite_link(
                         chat_id=channel_id,
                         member_limit=1,  # Single use - one-time link
                         expire_date=expire_date  # Expires 1 day from now
@@ -975,32 +1047,37 @@ def handle_active(message: telebot.types.Message):
                     ikb.add(types.InlineKeyboardButton(f"📺 {clean_course_name}", url=invite_link))
     
     if ikb.keyboard:
-        bot.send_message(user_id, text, reply_markup=ikb, disable_web_page_preview=True)
+        current_bot.send_message(user_id, text, reply_markup=ikb, disable_web_page_preview=True)
     else:
-        bot.send_message(user_id, text, disable_web_page_preview=True)
+        current_bot.send_message(user_id, text, disable_web_page_preview=True)
 
 @bot.message_handler(func=lambda m: m.text == "Поддержка")
 def handle_support(message: telebot.types.Message):
-    bot.send_message(message.from_user.id, SUPPORT_MSG)
+    current_bot = get_current_bot()
+    current_bot.send_message(message.from_user.id, SUPPORT_MSG)
 
 # Handler for email input for Prodamus payments
-@bot.message_handler(func=lambda m: m.from_user.id in prodamus_pending_emails)
+@bot.message_handler(func=lambda m: m.from_user.id in get_prodamus_pending_emails())
 def handle_prodamus_email(message: telebot.types.Message):
+    current_bot = get_current_bot()
+    current_bot = get_current_bot()
+    current_config = get_current_config()
+    prodamus_emails = get_prodamus_pending_emails()
     user_id = message.from_user.id
     email_text = message.text.strip()
     
     # Validate email format
     email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
     if not re.match(email_pattern, email_text):
-        bot.send_message(user_id, "❌ Неверный формат email адреса. Пожалуйста, отправьте корректный email (например: example@mail.ru)")
+        current_bot.send_message(user_id, "❌ Неверный формат email адреса. Пожалуйста, отправьте корректный email (например: example@mail.ru)")
         return
     
     # Get pending payment info
-    if user_id not in prodamus_pending_emails:
-        bot.send_message(user_id, "❌ Сессия истекла. Пожалуйста, начните оплату заново.")
+    if user_id not in prodamus_emails:
+        current_bot.send_message(user_id, "❌ Сессия истекла. Пожалуйста, начните оплату заново.")
         return
     
-    payment_info = prodamus_pending_emails.pop(user_id)
+    payment_info = prodamus_emails.pop(user_id)
     course_id = payment_info["course_id"]
     order_id = payment_info["order_id"]
     price = payment_info["price"]
@@ -1011,7 +1088,7 @@ def handle_prodamus_email(message: telebot.types.Message):
         user = get_user(user_id)
         if user:
             # Update user email in database (if you have email field)
-            conn = sqlite3.connect(DATABASE_PATH)
+            conn = sqlite3.connect(get_current_config()['DATABASE_PATH'])
             cur = conn.cursor()
             # Try to add email column if it doesn't exist
             try:
@@ -1039,7 +1116,7 @@ def handle_prodamus_email(message: telebot.types.Message):
         
         # Store payment info in database
         try:
-            conn = sqlite3.connect(DATABASE_PATH)
+            conn = sqlite3.connect(get_current_config()['DATABASE_PATH'])
             cur = conn.cursor()
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS pending_payments (
@@ -1069,7 +1146,7 @@ def handle_prodamus_email(message: telebot.types.Message):
             conn.commit()
             conn.close()
             
-            if PRODAMUS_TEST_MODE:
+            if get_current_payment_config()['PRODAMUS_TEST_MODE']:
                 print(f"[Prodamus] Stored pending payment with email: order_id={order_id}, email={customer_email}")
         except Exception as e:
             print(f"Error storing pending payment: {e}")
@@ -1084,35 +1161,37 @@ def handle_prodamus_email(message: telebot.types.Message):
         kb.add(types.InlineKeyboardButton("💳 Оплатить через Prodamus", url=payment_url))
         kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"course_{course_id}"))
         
-        bot.send_message(user_id, text, reply_markup=kb)
+        current_bot.send_message(user_id, text, reply_markup=kb)
         
-        if PRODAMUS_TEST_MODE:
+        if get_current_payment_config()['PRODAMUS_TEST_MODE']:
             print(f"[Prodamus TEST MODE] Generated payment URL with email for order_id {order_id}: {payment_url}")
             
     except Exception as e:
         error_msg = str(e)
         print(f"Error generating Prodamus payment URL: {error_msg}")
-        bot.send_message(user_id, "❌ Ошибка при создании ссылки на оплату. Пожалуйста, попробуйте позже или обратитесь в поддержку.")
+        current_bot.send_message(user_id, "❌ Ошибка при создании ссылки на оплату. Пожалуйста, попробуйте позже или обратитесь в поддержку.")
 
 
 # Handler for "Оферта" button
 @bot.message_handler(func=lambda m: m.text == "Оферта")
 def handle_oferta(message: telebot.types.Message):
+    current_bot = get_current_bot()
     user_id = message.from_user.id
     oferta_url = "https://github.com/george-dvoryak/cdn/blob/main/oferta.pdf?raw=true"
     try:
-        bot.send_document(user_id, oferta_url, caption="Договор оферты (PDF)")
+        current_bot.send_document(user_id, oferta_url, caption="Договор оферты (PDF)")
     except Exception:
         # Fallback: просто отправим ссылку, если по какой-то причине Telegram не скачал файл по URL
-        bot.send_message(user_id, f"Договор оферты: {oferta_url}", disable_web_page_preview=False)
+        current_bot.send_message(user_id, f"Договор оферты: {oferta_url}", disable_web_page_preview=False)
 
 # Admin handlers
 @bot.message_handler(func=lambda m: m.text == "📊 Все подписки")
 def handle_admin_all_subscriptions(message: telebot.types.Message):
+    current_bot = get_current_bot()
     """Admin handler: show all active subscriptions for all users"""
     user_id = message.from_user.id
-    if user_id not in ADMIN_IDS:
-        bot.send_message(user_id, "У вас нет доступа к этой функции.")
+    if user_id not in get_current_admin_ids():
+        current_bot.send_message(user_id, "У вас нет доступа к этой функции.")
         return
     
     try:
@@ -1120,7 +1199,7 @@ def handle_admin_all_subscriptions(message: telebot.types.Message):
         all_subs = list(all_subs) if all_subs else []
         
         if not all_subs:
-            bot.send_message(user_id, "Нет активных подписок.")
+            current_bot.send_message(user_id, "Нет активных подписок.")
             return
         
         # Group by user for better readability
@@ -1158,29 +1237,30 @@ def handle_admin_all_subscriptions(message: telebot.types.Message):
             current_msg = ""
             for part in parts:
                 if len(current_msg) + len(part) + 2 > 4000:
-                    bot.send_message(user_id, current_msg, disable_web_page_preview=True)
+                    current_bot.send_message(user_id, current_msg, disable_web_page_preview=True)
                     current_msg = part + "\n\n"
                 else:
                     current_msg += part + "\n\n"
             if current_msg.strip():
-                bot.send_message(user_id, current_msg, disable_web_page_preview=True)
+                current_bot.send_message(user_id, current_msg, disable_web_page_preview=True)
         else:
-            bot.send_message(user_id, text, disable_web_page_preview=True)
+            current_bot.send_message(user_id, text, disable_web_page_preview=True)
             
     except Exception as e:
         print(f"Error in handle_admin_all_subscriptions: {e}")
-        bot.send_message(user_id, f"Ошибка при получении подписок: {e}")
+        current_bot.send_message(user_id, f"Ошибка при получении подписок: {e}")
 
 @bot.message_handler(func=lambda m: m.text == "📋 Google Sheets")
 def handle_admin_google_sheets(message: telebot.types.Message):
+    current_bot = get_current_bot()
     """Admin handler: open Google Sheets link"""
     user_id = message.from_user.id
-    if user_id not in ADMIN_IDS:
-        bot.send_message(user_id, "У вас нет доступа к этой функции.")
+    if user_id not in get_current_admin_ids():
+        current_bot.send_message(user_id, "У вас нет доступа к этой функции.")
         return
     
     if not GSHEET_ID:
-        bot.send_message(user_id, "Google Sheets ID не настроен.")
+        current_bot.send_message(user_id, "Google Sheets ID не настроен.")
         return
     
     sheets_url = f"https://docs.google.com/spreadsheets/d/{GSHEET_ID}/edit"
@@ -1189,7 +1269,7 @@ def handle_admin_google_sheets(message: telebot.types.Message):
     keyboard = types.InlineKeyboardMarkup()
     keyboard.add(types.InlineKeyboardButton("📋 Открыть Google Sheets", url=sheets_url))
     
-    bot.send_message(
+    current_bot.send_message(
         user_id,
         "Нажмите на кнопку ниже, чтобы открыть Google Sheets:",
         reply_markup=keyboard
@@ -1197,21 +1277,22 @@ def handle_admin_google_sheets(message: telebot.types.Message):
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("course_"))
 def cb_course(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     user_id = c.from_user.id
     course_id = c.data.split("_", 1)[1]
     try:
         courses = get_courses_data()
     except Exception:
-        bot.answer_callback_query(c.id, "Ошибка загрузки курса.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Ошибка загрузки курса.", show_alert=True)
         return
     course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
     if not course:
-        bot.answer_callback_query(c.id, "Курс не найден.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Курс не найден.", show_alert=True)
         return
     
     # Check if course is active (is_active == 1)
     if course.get("is_active", 1) != 1:
-        bot.answer_callback_query(c.id, "Этот курс временно недоступен.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Этот курс временно недоступен.", show_alert=True)
         return
 
     name = course.get("name", "")
@@ -1243,7 +1324,7 @@ def cb_course(c: telebot.types.CallbackQuery):
                     
                     # Create invite link with appropriate parameters
                     # member_limit=1 means single use (one-time link)
-                    invite = bot.create_chat_invite_link(
+                    invite = current_bot.create_chat_invite_link(
                         chat_id=channel_id,
                         member_limit=1,  # Single use - one-time link
                         expire_date=expire_date  # Expires 1 day from now
@@ -1256,12 +1337,12 @@ def cb_course(c: telebot.types.CallbackQuery):
         ikb.add(types.InlineKeyboardButton("⬅️ Назад к каталогу", callback_data="back_to_catalog"))
         try:
             if c.message.content_type == "photo":
-                bot.edit_message_caption(chat_id=c.message.chat.id, message_id=c.message.message_id, caption=text, reply_markup=ikb, parse_mode='HTML')
+                current_bot.edit_message_caption(chat_id=c.message.chat.id, message_id=c.message.message_id, caption=text, reply_markup=ikb, parse_mode='HTML')
             else:
-                bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb, parse_mode='HTML')
+                current_bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb, parse_mode='HTML')
         except Exception:
-            bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
-        bot.answer_callback_query(c.id)
+            current_bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
+        current_bot.answer_callback_query(c.id)
         return
 
     # Format description with HTML support for Telegram
@@ -1275,7 +1356,7 @@ def cb_course(c: telebot.types.CallbackQuery):
     text = f"<b>{formatted_name}</b>\n{formatted_desc}\n\nЦена: {price} руб.\nДоступ: {duration_text}"
     ikb = types.InlineKeyboardMarkup()
     # Add payment buttons
-    if ENABLE_PRODAMUS and PRODAMUS_SECRET_KEY:
+    if get_current_payment_config()['ENABLE_PRODAMUS'] and get_current_payment_config()['PRODAMUS_SECRET_KEY']:
         ikb.row(
             types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"),
             types.InlineKeyboardButton("Купить (Prodamus)", callback_data=f"pay_prodamus_{course_id}")
@@ -1292,50 +1373,51 @@ def cb_course(c: telebot.types.CallbackQuery):
             if c.message.content_type == "photo":
                 # Try to edit photo
                 try:
-                    bot.edit_message_media(
+                    current_bot.edit_message_media(
                         chat_id=c.message.chat.id,
                         message_id=c.message.message_id,
                         media=types.InputMediaPhoto(image_url, caption=text, parse_mode='HTML'),
                         reply_markup=ikb
                     )
-                    bot.answer_callback_query(c.id)
+                    current_bot.answer_callback_query(c.id)
                     return
                 except Exception as e:
                     # If edit fails, delete old message and send new one
                     print(f"Failed to edit message media: {e}")
                     try:
-                        bot.delete_message(chat_id=c.message.chat.id, message_id=c.message.message_id)
+                        current_bot.delete_message(chat_id=c.message.chat.id, message_id=c.message.message_id)
                     except Exception:
                         pass
             # Send new photo (either because original wasn't photo, or edit/delete failed)
-            bot.send_photo(user_id, image_url, caption=text, reply_markup=ikb, parse_mode='HTML')
+            current_bot.send_photo(user_id, image_url, caption=text, reply_markup=ikb, parse_mode='HTML')
             message_sent = True
         else:
             # No course image - edit text or send new message
             if c.message.content_type == "photo":
                 # Original was photo, but course has no image - send text message
-                bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
+                current_bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
                 message_sent = True
             else:
                 # Original was text - can edit
                 try:
-                    bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb, parse_mode='HTML')
+                    current_bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb, parse_mode='HTML')
                     message_sent = True
                 except Exception as e:
                     print(f"Failed to edit message text: {e}")
                     # If edit fails, send new message
-                    bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
+                    current_bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
                     message_sent = True
-        bot.answer_callback_query(c.id)
+        current_bot.answer_callback_query(c.id)
     except Exception as e:
         # Fallback: send text message if everything else fails (only if we haven't sent anything yet)
         print(f"Error in course handler: {e}")
         if not message_sent:
-            bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
-        bot.answer_callback_query(c.id)
+            current_bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
+        current_bot.answer_callback_query(c.id)
 
 @bot.callback_query_handler(func=lambda c: c.data == "back_to_catalog")
 def cb_back_to_catalog(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     user_id = c.from_user.id
     send_catalog_message(
         user_id,
@@ -1343,27 +1425,28 @@ def cb_back_to_catalog(c: telebot.types.CallbackQuery):
         edit_message_id=c.message.message_id,
         edit_chat_id=c.message.chat.id
     )
-    bot.answer_callback_query(c.id)
+    current_bot.answer_callback_query(c.id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("buy_"))
 def cb_buy(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     user_id = c.from_user.id
     course_id = c.data.split("_", 1)[1]
     try:
         courses = get_courses_data()
     except Exception:
-        bot.answer_callback_query(c.id, "Не удалось получить данные курса.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Не удалось получить данные курса.", show_alert=True)
         return
     course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
     if not course:
-        bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
+        current_bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
         return
     # Check if course is active (is_active == 1)
     if course.get("is_active", 1) != 1:
-        bot.answer_callback_query(c.id, "Этот курс временно недоступен для покупки.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Этот курс временно недоступен для покупки.", show_alert=True)
         return
     if has_active_subscription(user_id, str(course_id)):
-        bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
         return
     name = course.get("name", "Курс")
     price = float(course.get("price", 0))
@@ -1371,7 +1454,7 @@ def cb_buy(c: telebot.types.CallbackQuery):
     text = f"{clean_name}\nВыберите способ оплаты:"
     kb = types.InlineKeyboardMarkup()
     # Add payment buttons
-    if ENABLE_PRODAMUS and PRODAMUS_SECRET_KEY:
+    if get_current_payment_config()['ENABLE_PRODAMUS'] and get_current_payment_config()['PRODAMUS_SECRET_KEY']:
         kb.row(
             types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"),
             types.InlineKeyboardButton("Prodamus", callback_data=f"pay_prodamus_{course_id}")
@@ -1379,31 +1462,32 @@ def cb_buy(c: telebot.types.CallbackQuery):
     else:
         kb.add(types.InlineKeyboardButton("ЮKassa", callback_data=f"pay_yk_{course_id}"))
     try:
-        bot.send_message(user_id, text, reply_markup=kb)
-        bot.answer_callback_query(c.id)
+        current_bot.send_message(user_id, text, reply_markup=kb)
+        current_bot.answer_callback_query(c.id)
     except Exception:
-        bot.answer_callback_query(c.id, "Ошибка при подготовке оплаты.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Ошибка при подготовке оплаты.", show_alert=True)
 
 # Handler for ЮKassa payments
 @bot.callback_query_handler(func=lambda c: c.data.startswith("pay_yk_"))
 def cb_pay_yk(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     user_id = c.from_user.id
     course_id = c.data.split("_", 2)[2]
     try:
         courses = get_courses_data()
     except Exception:
-        bot.answer_callback_query(c.id, "Не удалось получить данные курса.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Не удалось получить данные курса.", show_alert=True)
         return
     course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
     if not course:
-        bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
+        current_bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
         return
     # Check if course is active (is_active == 1)
     if course.get("is_active", 1) != 1:
-        bot.answer_callback_query(c.id, "Этот курс временно недоступен для покупки.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Этот курс временно недоступен для покупки.", show_alert=True)
         return
     if has_active_subscription(user_id, str(course_id)):
-        bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
         return
 
     name = course.get("name", "Курс")
@@ -1441,7 +1525,7 @@ def cb_pay_yk(c: telebot.types.CallbackQuery):
                 {
                     "description": item_description,
                     "quantity": 1,
-                    "amount": {"value": rub_str(price), "currency": CURRENCY},
+                    "amount": {"value": rub_str(price), "currency": get_current_payment_config()['CURRENCY']},
                     "vat_code": 1
                 }
             ]
@@ -1452,12 +1536,12 @@ def cb_pay_yk(c: telebot.types.CallbackQuery):
     # Strip HTML from invoice title
     clean_title_name = strip_html(name) if name else "Курс"
     try:
-        bot.send_invoice(
+        current_bot.send_invoice(
             user_id,
             title=f"Курс: {clean_title_name}",
             description=invoice_description,
-            provider_token=PAYMENT_PROVIDER_TOKEN,
-            currency=CURRENCY,
+            provider_token=get_current_payment_config()['PAYMENT_PROVIDER_TOKEN'],
+            currency=get_current_payment_config()['CURRENCY'],
             prices=prices,
             start_parameter="purchase-course",
             invoice_payload=payload,
@@ -1465,45 +1549,46 @@ def cb_pay_yk(c: telebot.types.CallbackQuery):
             send_email_to_provider=True,
             provider_data=provider_data_json
         )
-        bot.answer_callback_query(c.id)
+        current_bot.answer_callback_query(c.id)
     except Exception as e:
         print("send_invoice (YK) error:", e)
-        bot.answer_callback_query(c.id, "Ошибка при выставлении счета (ЮKassa).", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Ошибка при выставлении счета (ЮKassa).", show_alert=True)
 
 # Handler for Prodamus direct payments (via payment link)
 @bot.callback_query_handler(func=lambda c: c.data.startswith("pay_prodamus_"))
 def cb_pay_prodamus(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     user_id = c.from_user.id
     course_id = c.data.split("_", 2)[2]
     
     # Validate Prodamus configuration
-    if not PRODAMUS_SECRET_KEY:
-        bot.answer_callback_query(c.id, "Prodamus не настроена. Обратитесь к администратору.", show_alert=True)
+    if not get_current_payment_config()['PRODAMUS_SECRET_KEY']:
+        current_bot.answer_callback_query(c.id, "Prodamus не настроена. Обратитесь к администратору.", show_alert=True)
         return
     
     # Log test mode status
-    if PRODAMUS_TEST_MODE:
+    if get_current_payment_config()['PRODAMUS_TEST_MODE']:
         print(f"[Prodamus TEST MODE] Payment request from user {user_id} for course {course_id}")
     
     try:
         courses = get_courses_data()
     except Exception as e:
         print(f"Error fetching courses for Prodamus payment: {e}")
-        bot.answer_callback_query(c.id, "Не удалось получить данные курса.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Не удалось получить данные курса.", show_alert=True)
         return
     
     course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
     if not course:
-        bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
+        current_bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
         return
     
     # Check if course is active (is_active == 1)
     if course.get("is_active", 1) != 1:
-        bot.answer_callback_query(c.id, "Этот курс временно недоступен для покупки.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Этот курс временно недоступен для покупки.", show_alert=True)
         return
     
     if has_active_subscription(user_id, str(course_id)):
-        bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
         return
 
     name = course.get("name", "Курс")
@@ -1511,7 +1596,7 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
     
     # Validate price
     if price <= 0:
-        bot.answer_callback_query(c.id, "Неверная цена курса.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Неверная цена курса.", show_alert=True)
         return
 
     # Generate unique order ID for Prodamus
@@ -1539,7 +1624,7 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
                 except:
                     pass
     except Exception as e:
-        if PRODAMUS_TEST_MODE:
+        if get_current_payment_config()['PRODAMUS_TEST_MODE']:
             print(f"[Prodamus] Error getting user email: {e}")
         pass
     
@@ -1560,8 +1645,8 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("⬅️ Отмена", callback_data=f"course_{course_id}"))
         
-        bot.send_message(user_id, text, reply_markup=kb)
-        bot.answer_callback_query(c.id)
+        current_bot.send_message(user_id, text, reply_markup=kb)
+        current_bot.answer_callback_query(c.id)
         return
     
     # We have email, proceed with payment URL generation
@@ -1579,7 +1664,7 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
         
         # Store payment info in database for later verification
         try:
-            conn = sqlite3.connect(DATABASE_PATH)
+            conn = sqlite3.connect(get_current_config()['DATABASE_PATH'])
             cur = conn.cursor()
             # Create pending_payments table if not exists
             cur.execute("""
@@ -1612,7 +1697,7 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
             conn.commit()
             conn.close()
             
-            if PRODAMUS_TEST_MODE:
+            if get_current_payment_config()['PRODAMUS_TEST_MODE']:
                 print(f"[Prodamus] Stored pending payment: order_id={order_id}, user_id={user_id}, course_id={course_id}, amount={price}, email={customer_email}")
         except Exception as e:
             print(f"Error storing pending payment: {e}")
@@ -1629,53 +1714,55 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
         kb.add(types.InlineKeyboardButton("💳 Оплатить через Prodamus", url=payment_url))
         kb.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"course_{course_id}"))
         
-        bot.send_message(user_id, text, reply_markup=kb)
-        bot.answer_callback_query(c.id)
+        current_bot.send_message(user_id, text, reply_markup=kb)
+        current_bot.answer_callback_query(c.id)
         
-        if PRODAMUS_TEST_MODE:
+        if get_current_payment_config()['PRODAMUS_TEST_MODE']:
             print(f"[Prodamus TEST MODE] Generated payment URL for order_id {order_id}: {payment_url}")
             
     except Exception as e:
         error_msg = str(e)
         print(f"Error generating Prodamus payment URL: {error_msg}")
-        if PRODAMUS_TEST_MODE:
+        if get_current_payment_config()['PRODAMUS_TEST_MODE']:
             print(f"[Prodamus TEST MODE] Full error details: {repr(e)}")
-        bot.answer_callback_query(c.id, "Ошибка при создании ссылки на оплату.", show_alert=True)
+        current_bot.answer_callback_query(c.id, "Ошибка при создании ссылки на оплату.", show_alert=True)
 
 @bot.pre_checkout_query_handler(func=lambda q: True)
 def handle_pre_checkout(q: telebot.types.PreCheckoutQuery):
+    current_bot = get_current_bot()
     try:
         user_id = q.from_user.id
         payload = q.invoice_payload
         # Payload format: "user_id:course_id"
         parts = payload.split(":", 1)
         if len(parts) < 2:
-            bot.answer_pre_checkout_query(q.id, ok=False, error_message="Неверный формат заказа.")
+            current_bot.answer_pre_checkout_query(q.id, ok=False, error_message="Неверный формат заказа.")
             return
         # Extract course_id (second part), user_id validation not needed here
         cid = parts[1]
         courses = get_courses_data()
         course = next((x for x in courses if str(x.get("id")) == str(cid)), None)
         if course is None:
-            bot.answer_pre_checkout_query(q.id, ok=False, error_message=COURSE_NOT_AVAILABLE_MSG)
+            current_bot.answer_pre_checkout_query(q.id, ok=False, error_message=COURSE_NOT_AVAILABLE_MSG)
             return
         if has_active_subscription(user_id, str(cid)):
-            bot.answer_pre_checkout_query(q.id, ok=False, error_message="Этот курс уже активен у вас.")
+            current_bot.answer_pre_checkout_query(q.id, ok=False, error_message="Этот курс уже активен у вас.")
             return
-        bot.answer_pre_checkout_query(q.id, ok=True)
+        current_bot.answer_pre_checkout_query(q.id, ok=True)
     except Exception as e:
         print("pre_checkout error:", e)
-        bot.answer_pre_checkout_query(q.id, ok=False, error_message="Ошибка проверки заказа.")
+        current_bot.answer_pre_checkout_query(q.id, ok=False, error_message="Ошибка проверки заказа.")
 
 @bot.message_handler(content_types=['successful_payment'])
 def handle_successful_payment(message: telebot.types.Message):
+    current_bot = get_current_bot()
     payment = message.successful_payment
     user_id = message.from_user.id
     payload = payment.invoice_payload
     # Payload format: "user_id:course_id"
     parts = payload.split(":", 1)
     if len(parts) < 2:
-        bot.send_message(user_id, "Ошибка: неверный формат заказа. Обратитесь в поддержку.")
+        current_bot.send_message(user_id, "Ошибка: неверный формат заказа. Обратитесь в поддержку.")
         return
     # Extract course_id (second part)
     course_id = parts[1]
@@ -1703,7 +1790,7 @@ def handle_successful_payment(message: telebot.types.Message):
             
             # Create invite link with appropriate parameters
             # member_limit=1 means single use (one-time link)
-            invite = bot.create_chat_invite_link(
+            invite = current_bot.create_chat_invite_link(
                 chat_id=channel,
                 member_limit=1,  # Single use - one-time link
                 expire_date=expire_date  # Expires 1 day from now
@@ -1721,16 +1808,16 @@ def handle_successful_payment(message: telebot.types.Message):
     if invite_link:
         kb = types.InlineKeyboardMarkup()
         kb.add(types.InlineKeyboardButton("Перейти в канал курса", url=invite_link))
-        bot.send_message(user_id, text, reply_markup=kb)
+        current_bot.send_message(user_id, text, reply_markup=kb)
     else:
-        bot.send_message(user_id, text)
+        current_bot.send_message(user_id, text)
 
     # Notify admins
     try:
         amount = payment.total_amount / 100.0
         cur = payment.currency
     except Exception:
-        amount, cur = 0, CURRENCY
+        amount, cur = 0, get_current_payment_config()['CURRENCY']
     buyer_email = None
     try:
         if payment.order_info and payment.order_info.email:
@@ -1741,9 +1828,9 @@ def handle_successful_payment(message: telebot.types.Message):
     admin_text = f"💰 Оплата: пользователь {user_id} купил {clean_course_name} на сумму {amount:.2f} {cur}."
     if buyer_email:
         admin_text += f"\nEmail: {buyer_email}"
-    for aid in ADMIN_IDS:
+    for aid in get_current_admin_ids():
         try:
-            bot.send_message(aid, admin_text)
+            current_bot.send_message(aid, admin_text)
         except Exception:
             pass
 
@@ -1762,11 +1849,12 @@ def send_receipt_to_tax(user_id: int, course_name: str, amount: float, buyer_ema
 # Admin broadcasts
 @bot.message_handler(commands=['cleanup_expired'])
 def handle_cleanup_expired(message: telebot.types.Message):
+    current_bot = get_current_bot()
     """Admin command to manually trigger expired subscriptions cleanup"""
-    if message.from_user.id not in ADMIN_IDS:
+    if message.from_user.id not in get_current_admin_ids():
         return
     
-    bot.reply_to(message, "🔄 Запуск очистки просроченных подписок...")
+    current_bot.reply_to(message, "🔄 Запуск очистки просроченных подписок...")
     
     try:
         from db import get_expired_subscriptions, mark_subscription_expired, get_connection
@@ -1788,7 +1876,7 @@ def handle_cleanup_expired(message: telebot.types.Message):
         report += f"• Активных: {active_count}\n\n"
         
         if expired_count == 0:
-            bot.reply_to(message, report + "✅ Просроченных подписок не найдено.")
+            current_bot.reply_to(message, report + "✅ Просроченных подписок не найдено.")
             return
         
         # Process expired subscriptions
@@ -1808,7 +1896,7 @@ def handle_cleanup_expired(message: telebot.types.Message):
                     if not ok:
                         # Double check
                         try:
-                            member = bot.get_chat_member(channel_id, user_id)
+                            member = current_bot.get_chat_member(channel_id, user_id)
                             status = getattr(member, "status", "unknown")
                             if status in ("left", "kicked"):
                                 ok = True
@@ -1820,7 +1908,7 @@ def handle_cleanup_expired(message: telebot.types.Message):
                 # Try to notify user
                 try:
                     clean_course_name = strip_html(course_name) if course_name else "курсу"
-                    bot.send_message(user_id, f"Доступ к курсу {clean_course_name} завершен. Спасибо, что были с нами!")
+                    current_bot.send_message(user_id, f"Доступ к курсу {clean_course_name} завершен. Спасибо, что были с нами!")
                 except:
                     pass
                 
@@ -1833,10 +1921,10 @@ def handle_cleanup_expired(message: telebot.types.Message):
         if failed > 0:
             report += f"⚠️ Ошибок: {failed}"
         
-        bot.reply_to(message, report)
+        current_bot.reply_to(message, report)
         
     except Exception as e:
-        bot.reply_to(message, f"❌ Ошибка при очистке: {e}")
+        current_bot.reply_to(message, f"❌ Ошибка при очистке: {e}")
         import traceback
         print(f"Cleanup error: {traceback.format_exc()}")
 
@@ -1846,10 +1934,11 @@ db_clear_confirmations = {}
 
 @bot.message_handler(commands=['clear_db'])
 def handle_clear_db(message: telebot.types.Message):
+    current_bot = get_current_bot()
     """Admin command to clear all database data"""
     user_id = message.from_user.id
-    if user_id not in ADMIN_IDS:
-        bot.reply_to(message, "❌ У вас нет доступа к этой команде.")
+    if user_id not in get_current_admin_ids():
+        current_bot.reply_to(message, "❌ У вас нет доступа к этой команде.")
         return
     
     # Check if user already confirmed
@@ -1869,9 +1958,9 @@ def handle_clear_db(message: telebot.types.Message):
             report += f"• Ожидающих платежей: {stats['pending_payments']}\n\n"
             report += "✅ База данных теперь пуста."
             
-            bot.reply_to(message, report, parse_mode='HTML')
+            current_bot.reply_to(message, report, parse_mode='HTML')
         except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка при очистке базы данных: {e}")
+            current_bot.reply_to(message, f"❌ Ошибка при очистке базы данных: {e}")
     else:
         # First time - show warning and ask for confirmation
         try:
@@ -1906,16 +1995,17 @@ def handle_clear_db(message: telebot.types.Message):
             kb.add(types.InlineKeyboardButton("✅ Да, очистить базу данных", callback_data="confirm_clear_db"))
             kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="cancel_clear_db"))
             
-            bot.reply_to(message, warning, reply_markup=kb, parse_mode='HTML')
+            current_bot.reply_to(message, warning, reply_markup=kb, parse_mode='HTML')
         except Exception as e:
-            bot.reply_to(message, f"❌ Ошибка при получении статистики: {e}")
+            current_bot.reply_to(message, f"❌ Ошибка при получении статистики: {e}")
 
 @bot.callback_query_handler(func=lambda c: c.data == "confirm_clear_db")
 def cb_confirm_clear_db(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     """Handle confirmation to clear database"""
     user_id = c.from_user.id
-    if user_id not in ADMIN_IDS:
-        bot.answer_callback_query(c.id, "❌ У вас нет доступа.", show_alert=True)
+    if user_id not in get_current_admin_ids():
+        current_bot.answer_callback_query(c.id, "❌ У вас нет доступа.", show_alert=True)
         return
     
     # Mark user as confirmed
@@ -1923,7 +2013,7 @@ def cb_confirm_clear_db(c: telebot.types.CallbackQuery):
     
     # Edit message to show confirmation
     try:
-        bot.edit_message_text(
+        current_bot.edit_message_text(
             "✅ Подтверждение получено. Отправьте команду /clear_db еще раз для выполнения очистки.",
             chat_id=c.message.chat.id,
             message_id=c.message.message_id
@@ -1931,14 +2021,15 @@ def cb_confirm_clear_db(c: telebot.types.CallbackQuery):
     except Exception:
         pass
     
-    bot.answer_callback_query(c.id, "Подтверждение получено. Отправьте /clear_db еще раз.")
+    current_bot.answer_callback_query(c.id, "Подтверждение получено. Отправьте /clear_db еще раз.")
 
 @bot.callback_query_handler(func=lambda c: c.data == "cancel_clear_db")
 def cb_cancel_clear_db(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     """Handle cancellation of database clearing"""
     user_id = c.from_user.id
-    if user_id not in ADMIN_IDS:
-        bot.answer_callback_query(c.id, "❌ У вас нет доступа.", show_alert=True)
+    if user_id not in get_current_admin_ids():
+        current_bot.answer_callback_query(c.id, "❌ У вас нет доступа.", show_alert=True)
         return
     
     # Remove from confirmations if exists
@@ -1947,7 +2038,7 @@ def cb_cancel_clear_db(c: telebot.types.CallbackQuery):
     
     # Edit message to show cancellation
     try:
-        bot.edit_message_text(
+        current_bot.edit_message_text(
             "❌ Очистка базы данных отменена.",
             chat_id=c.message.chat.id,
             message_id=c.message.message_id
@@ -1955,15 +2046,16 @@ def cb_cancel_clear_db(c: telebot.types.CallbackQuery):
     except Exception:
         pass
     
-    bot.answer_callback_query(c.id, "Очистка отменена.")
+    current_bot.answer_callback_query(c.id, "Очистка отменена.")
 
 @bot.message_handler(commands=['broadcast_all', 'broadcast_buyers', 'broadcast_nonbuyers'])
 def handle_broadcast(message: telebot.types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    current_bot = get_current_bot()
+    if message.from_user.id not in get_current_admin_ids():
         return
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        bot.reply_to(message, "После команды укажите текст сообщения.")
+        current_bot.reply_to(message, "После команды укажите текст сообщения.")
         return
     cmd = parts[0]
     text = parts[1]
@@ -1971,7 +2063,7 @@ def handle_broadcast(message: telebot.types.Message):
     recipients = []
     try:
         # Use separate connection for broadcast to avoid conflicts
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = sqlite3.connect(get_current_config()['DATABASE_PATH'])
         cur = conn.cursor()
         if cmd == "/broadcast_all":
             cur.execute("SELECT user_id FROM users;")
@@ -1984,14 +2076,14 @@ def handle_broadcast(message: telebot.types.Message):
         conn.close()
     except Exception as e:
         print(f"Broadcast database error: {e}")
-        bot.reply_to(message, f"Ошибка при получении списка получателей: {e}")
+        current_bot.reply_to(message, f"Ошибка при получении списка получателей: {e}")
         return
 
     sent = 0
     failed = 0
     for uid in recipients:
         try:
-            bot.send_message(uid, text, disable_web_page_preview=True)
+            current_bot.send_message(uid, text, disable_web_page_preview=True)
             sent += 1
         except Exception as e:
             failed += 1
@@ -2002,9 +2094,10 @@ def handle_broadcast(message: telebot.types.Message):
     reply_msg = f"Отправлено {sent} из {total} пользователям."
     if failed > 0:
         reply_msg += f" Не удалось отправить: {failed}."
-    bot.reply_to(message, reply_msg)
+    current_bot.reply_to(message, reply_msg)
 
 def send_broadcast_messages(recipients: list, text: str, photo_file_id: str = None):
+    current_bot = get_current_bot()
     """
     Send broadcast messages to recipients.
     Returns tuple (sent_count, failed_count)
@@ -2016,10 +2109,10 @@ def send_broadcast_messages(recipients: list, text: str, photo_file_id: str = No
         try:
             if photo_file_id:
                 # Send photo with caption
-                bot.send_photo(uid, photo_file_id, caption=text, disable_web_page_preview=True)
+                current_bot.send_photo(uid, photo_file_id, caption=text, disable_web_page_preview=True)
             else:
                 # Send text only
-                bot.send_message(uid, text, disable_web_page_preview=True)
+                current_bot.send_message(uid, text, disable_web_page_preview=True)
             sent += 1
         except Exception as e:
             failed += 1
@@ -2032,6 +2125,7 @@ def send_broadcast_messages(recipients: list, text: str, photo_file_id: str = No
 # Admin broadcast handler - button in menu
 @bot.message_handler(func=lambda m: m.text == "📢 Рассылка" and m.from_user.id in ADMIN_IDS)
 def handle_broadcast_button(message: telebot.types.Message):
+    current_bot = get_current_bot()
     """Show broadcast type selection"""
     user_id = message.from_user.id
     
@@ -2045,14 +2139,15 @@ def handle_broadcast_button(message: telebot.types.Message):
     kb.add(types.InlineKeyboardButton("🆕 Непокупателям", callback_data="broadcast_type_nonbuyers"))
     kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel"))
     
-    bot.send_message(user_id, text, reply_markup=kb)
+    current_bot.send_message(user_id, text, reply_markup=kb)
 
 # Broadcast type selection callback
 @bot.callback_query_handler(func=lambda c: c.data.startswith("broadcast_type_"))
 def cb_broadcast_type(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     user_id = c.from_user.id
-    if user_id not in ADMIN_IDS:
-        bot.answer_callback_query(c.id, "У вас нет доступа.")
+    if user_id not in get_current_admin_ids():
+        current_bot.answer_callback_query(c.id, "У вас нет доступа.")
         return
     
     broadcast_type = c.data.split("_")[-1]  # all, buyers, nonbuyers
@@ -2074,23 +2169,25 @@ def cb_broadcast_type(c: telebot.types.CallbackQuery):
     kb = types.InlineKeyboardMarkup()
     kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel"))
     
-    bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=kb)
-    bot.answer_callback_query(c.id)
+    current_bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=kb)
+    current_bot.answer_callback_query(c.id)
 
 # Cancel broadcast
 @bot.callback_query_handler(func=lambda c: c.data == "broadcast_cancel")
 def cb_broadcast_cancel(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     user_id = c.from_user.id
     if user_id in admin_broadcast_state:
         del admin_broadcast_state[user_id]
     
-    bot.edit_message_text("❌ Рассылка отменена.", chat_id=c.message.chat.id, message_id=c.message.message_id)
-    bot.answer_callback_query(c.id)
+    current_bot.edit_message_text("❌ Рассылка отменена.", chat_id=c.message.chat.id, message_id=c.message.message_id)
+    current_bot.answer_callback_query(c.id)
 
 # Handle text message for broadcast
 # This handler must be before other text handlers to catch broadcast text
 @bot.message_handler(func=lambda m: m.from_user.id in admin_broadcast_state and m.from_user.id in ADMIN_IDS and m.text and not m.text.startswith("/") and m.text not in ["Каталог", "Активные подписки", "Поддержка", "Оферта", "📊 Все подписки", "📋 Google Sheets", "📢 Рассылка"])
 def handle_broadcast_text(message: telebot.types.Message):
+    current_bot = get_current_bot()
     """Handle text input for broadcast"""
     user_id = message.from_user.id
     
@@ -2118,11 +2215,12 @@ def handle_broadcast_text(message: telebot.types.Message):
         kb.add(types.InlineKeyboardButton("✅ Отправить сейчас", callback_data="broadcast_send"))
         kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel"))
         
-        bot.send_message(user_id, text, reply_markup=kb)
+        current_bot.send_message(user_id, text, reply_markup=kb)
 
 # Handle photo for broadcast
 @bot.message_handler(func=lambda m: m.from_user.id in admin_broadcast_state and m.from_user.id in ADMIN_IDS and m.photo, content_types=['photo'])
 def handle_broadcast_photo(message: telebot.types.Message):
+    current_bot = get_current_bot()
     """Handle photo input for broadcast"""
     user_id = message.from_user.id
     
@@ -2147,52 +2245,55 @@ def handle_broadcast_photo(message: telebot.types.Message):
         kb.add(types.InlineKeyboardButton("✅ Отправить рассылку", callback_data="broadcast_send"))
         kb.add(types.InlineKeyboardButton("❌ Отмена", callback_data="broadcast_cancel"))
         
-        bot.send_message(user_id, text, reply_markup=kb)
+        current_bot.send_message(user_id, text, reply_markup=kb)
     else:
-        bot.send_message(user_id, "📷 Фото сохранено. Теперь отправьте текст сообщения.")
+        current_bot.send_message(user_id, "📷 Фото сохранено. Теперь отправьте текст сообщения.")
 
 # Send broadcast callback
 @bot.callback_query_handler(func=lambda c: c.data == "broadcast_send")
 def cb_broadcast_send(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     user_id = c.from_user.id
-    if user_id not in ADMIN_IDS:
-        bot.answer_callback_query(c.id, "У вас нет доступа.")
+    if user_id not in get_current_admin_ids():
+        current_bot.answer_callback_query(c.id, "У вас нет доступа.")
         return
     
     if user_id not in admin_broadcast_state:
-        bot.answer_callback_query(c.id, "Ошибка: состояние рассылки не найдено.")
+        current_bot.answer_callback_query(c.id, "Ошибка: состояние рассылки не найдено.")
         return
     
     state = admin_broadcast_state[user_id]
     
     if not state.get("text"):
-        bot.answer_callback_query(c.id, "Ошибка: текст сообщения не указан.")
+        current_bot.answer_callback_query(c.id, "Ошибка: текст сообщения не указан.")
         return
     
     execute_broadcast(user_id, state)
-    bot.answer_callback_query(c.id)
+    current_bot.answer_callback_query(c.id)
 
 # Add photo callback
 @bot.callback_query_handler(func=lambda c: c.data == "broadcast_add_photo")
 def cb_broadcast_add_photo(c: telebot.types.CallbackQuery):
+    current_bot = get_current_bot()
     user_id = c.from_user.id
-    bot.edit_message_text("📷 Отправьте фото для рассылки.", chat_id=c.message.chat.id, message_id=c.message.message_id)
-    bot.answer_callback_query(c.id)
+    current_bot.edit_message_text("📷 Отправьте фото для рассылки.", chat_id=c.message.chat.id, message_id=c.message.message_id)
+    current_bot.answer_callback_query(c.id)
 
 def execute_broadcast(user_id: int, state: dict):
+    current_bot = get_current_bot()
     """Execute broadcast with given state"""
     broadcast_type = state.get("type")
     text = state.get("text")
     photo = state.get("photo")
     
     if not broadcast_type or not text:
-        bot.send_message(user_id, "❌ Ошибка: не указан тип рассылки или текст.")
+        current_bot.send_message(user_id, "❌ Ошибка: не указан тип рассылки или текст.")
         return
     
     # Get recipients
     recipients = []
     try:
-        conn = sqlite3.connect(DATABASE_PATH)
+        conn = sqlite3.connect(get_current_config()['DATABASE_PATH'])
         cur = conn.cursor()
         if broadcast_type == "all":
             cur.execute("SELECT user_id FROM users;")
@@ -2205,11 +2306,11 @@ def execute_broadcast(user_id: int, state: dict):
         conn.close()
     except Exception as e:
         print(f"Broadcast database error: {e}")
-        bot.send_message(user_id, f"❌ Ошибка при получении списка получателей: {e}")
+        current_bot.send_message(user_id, f"❌ Ошибка при получении списка получателей: {e}")
         return
     
     if not recipients:
-        bot.send_message(user_id, "❌ Получатели не найдены.")
+        current_bot.send_message(user_id, "❌ Получатели не найдены.")
         # Clear state
         if user_id in admin_broadcast_state:
             del admin_broadcast_state[user_id]
@@ -2221,7 +2322,7 @@ def execute_broadcast(user_id: int, state: dict):
         "buyers": "покупателям",
         "nonbuyers": "непокупателям"
     }
-    progress_msg = bot.send_message(user_id, f"📤 Отправка рассылки {type_names.get(broadcast_type, '')}...\nПолучателей: {len(recipients)}")
+    progress_msg = current_bot.send_message(user_id, f"📤 Отправка рассылки {type_names.get(broadcast_type, '')}...\nПолучателей: {len(recipients)}")
     
     # Send messages
     sent, failed = send_broadcast_messages(recipients, text, photo)
@@ -2232,7 +2333,7 @@ def execute_broadcast(user_id: int, state: dict):
     stats_text += f"❌ Не удалось отправить: {failed}\n"
     stats_text += f"📊 Всего получателей: {len(recipients)}"
     
-    bot.edit_message_text(stats_text, chat_id=progress_msg.chat.id, message_id=progress_msg.message_id)
+    current_bot.edit_message_text(stats_text, chat_id=progress_msg.chat.id, message_id=progress_msg.message_id)
     
     # Clear state
     if user_id in admin_broadcast_state:
@@ -2240,6 +2341,7 @@ def execute_broadcast(user_id: int, state: dict):
 
 
 def remove_user_from_channel(user_id: int, channel_id: str):
+    current_bot = get_current_bot()
     """
     Remove user from channel by banning and immediately unbanning.
     This effectively removes the user from the channel.
@@ -2256,7 +2358,7 @@ def remove_user_from_channel(user_id: int, channel_id: str):
     # First, check if user is actually a member before attempting removal
     try:
         print(f"[{timestamp}] [remove_user_from_channel] Checking user membership status...")
-        member = bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+        member = current_bot.get_chat_member(chat_id=channel_id, user_id=user_id)
         member_status = getattr(member, "status", "unknown")
         print(f"[{timestamp}] [remove_user_from_channel] User {user_id} current status in channel {channel_id}: {member_status}")
         
@@ -2271,17 +2373,17 @@ def remove_user_from_channel(user_id: int, channel_id: str):
     try:
         print(f"[{timestamp}] [remove_user_from_channel] Attempting to ban user {user_id} from channel {channel_id}...")
         # First, try to ban the user (removes them from channel)
-        bot.ban_chat_member(chat_id=channel_id, user_id=user_id, until_date=None)
+        current_bot.ban_chat_member(chat_id=channel_id, user_id=user_id, until_date=None)
         print(f"[{timestamp}] [remove_user_from_channel] Successfully banned user {user_id}")
         
         # Then immediately unban (allows them to rejoin if needed, but they're already removed)
         print(f"[{timestamp}] [remove_user_from_channel] Unbanning user {user_id}...")
-        bot.unban_chat_member(chat_id=channel_id, user_id=user_id, only_if_banned=True)
+        current_bot.unban_chat_member(chat_id=channel_id, user_id=user_id, only_if_banned=True)
         print(f"[{timestamp}] [remove_user_from_channel] Successfully unbanned user {user_id}")
         
         # Verify removal by checking status again
         try:
-            member = bot.get_chat_member(chat_id=channel_id, user_id=user_id)
+            member = current_bot.get_chat_member(chat_id=channel_id, user_id=user_id)
             final_status = getattr(member, "status", "unknown")
             print(f"[{timestamp}] [remove_user_from_channel] Verification: User {user_id} final status: {final_status}")
             if final_status in ("left", "kicked"):
@@ -2317,6 +2419,7 @@ def remove_user_from_channel(user_id: int, channel_id: str):
 
 # Диагностика каналов / админ-команда
 def check_course_channels() -> str:
+    current_bot = get_current_bot()
     """
     Проверяем корректность поля 'channel' у курсов и права бота.
     Возвращает человекочитаемый отчёт.
@@ -2324,7 +2427,7 @@ def check_course_channels() -> str:
     lines = []
     # Кто мы
     try:
-        me = bot.get_me()
+        me = current_bot.get_me()
         bot_id = me.id
         bot_name = f"@{me.username}" if getattr(me, "username", None) else str(me.id)
     except Exception as e:
@@ -2351,7 +2454,7 @@ def check_course_channels() -> str:
 
         # Проверяем доступность чата
         try:
-            chat = bot.get_chat(channel)
+            chat = current_bot.get_chat(channel)
         except Exception as e:
             clean_name = strip_html(name) if name else "Курс"
             lines.append(f"• {clean_name} — {channel}: ❌ чат недоступен для бота (возможно, бот не добавлен/не админ, или неверный ID). Ошибка: {e}")
@@ -2365,7 +2468,7 @@ def check_course_channels() -> str:
         else:
             # Приватный/числовой ID — проверяем, что бот админ и может приглашать
             try:
-                admins = bot.get_chat_administrators(chat.id)
+                admins = current_bot.get_chat_administrators(chat.id)
             except Exception as e:
                 clean_name = strip_html(name) if name else "Курс"
                 lines.append(f"• {clean_name} — {channel}: ⚠️ не удалось получить админов. Ошибка: {e}")
@@ -2398,7 +2501,8 @@ def check_course_channels() -> str:
 
 @bot.message_handler(commands=["diag_channels"])
 def handle_diag_channels(message: telebot.types.Message):
-    if message.from_user.id not in ADMIN_IDS:
+    current_bot = get_current_bot()
+    if message.from_user.id not in get_current_admin_ids():
         return
     report = check_course_channels()
     # Делим длинные ответы на части
@@ -2413,7 +2517,7 @@ def handle_diag_channels(message: telebot.types.Message):
         parts.append(current)
     for p in parts:
         try:
-            bot.send_message(message.chat.id, "🔎 Диагностика каналов:\n" + p, disable_web_page_preview=True)
+            current_bot.send_message(message.chat.id, "🔎 Диагностика каналов:\n" + p, disable_web_page_preview=True)
         except Exception:
             pass
 
@@ -2424,7 +2528,7 @@ if __name__ == "__main__":
         # Однократная проверка каналов при старте
         try:
             startup_report = check_course_channels()
-            for aid in ADMIN_IDS:
+            for aid in get_current_admin_ids():
                 try:
                     bot.send_message(aid, "🔎 Диагностика каналов при старте:\n" + startup_report, disable_web_page_preview=True)
                 except Exception:

@@ -2,10 +2,16 @@
 import csv
 import requests
 
-from config import GSHEET_ID, GSHEET_COURSES_NAME, GSHEET_TEXTS_NAME, GOOGLE_SHEETS_USE_API, GOOGLE_CREDENTIALS_FILE
+from config import GSHEET_ID, GSHEET_COURSES_NAME, GSHEET_TEXTS_NAME, GOOGLE_SHEETS_USE_API, GOOGLE_CREDENTIALS_FILE, get_bot_config, CURRENT_BOT_NAME
 
-def fetch_sheet_csv(sheet_name: str):
-    url = f"https://docs.google.com/spreadsheets/d/{GSHEET_ID}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+def fetch_sheet_csv(sheet_name: str, gsheet_id: str = None):
+    """
+    Fetch CSV data from Google Sheets.
+    If gsheet_id is not provided, uses current bot's GSHEET_ID.
+    """
+    if gsheet_id is None:
+        gsheet_id = GSHEET_ID
+    url = f"https://docs.google.com/spreadsheets/d/{gsheet_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     content = resp.content.decode('utf-8')
@@ -24,18 +30,34 @@ def parse_duration(value):
     except (ValueError, TypeError):
         return None  # Unlimited access if can't parse
 
-def get_courses_data():
-    if GOOGLE_SHEETS_USE_API:
+def get_courses_data(bot_name: str = None):
+    """
+    Get courses data from Google Sheets.
+    If bot_name is provided, uses configuration for that bot.
+    Otherwise, tries to get bot_name from context, or uses current bot configuration.
+    """
+    if bot_name is None:
+        from bot_context import get_bot_context
+        bot_name = get_bot_context() or CURRENT_BOT_NAME
+    
+    config = get_bot_config(bot_name)
+    gsheet_id = config['GSHEET_ID']
+    courses_name = config['GSHEET_COURSES_NAME']
+    texts_name = config['GSHEET_TEXTS_NAME']
+    use_api = config['GOOGLE_SHEETS_USE_API']
+    credentials_file = config['GOOGLE_CREDENTIALS_FILE']
+    
+    if use_api:
         try:
             import gspread
             from oauth2client.service_account import ServiceAccountCredentials
         except ImportError:
             raise RuntimeError("gspread/oauth2client not installed. Set GOOGLE_SHEETS_USE_API=False or install libs.")
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive.readonly"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_name(credentials_file, scope)
         client = gspread.authorize(creds)
-        sheet = client.open_by_key(GSHEET_ID)
-        ws = sheet.worksheet(GSHEET_COURSES_NAME)
+        sheet = client.open_by_key(gsheet_id)
+        ws = sheet.worksheet(courses_name)
         records = ws.get_all_records()
         courses = []
         for rec in records:
@@ -62,7 +84,7 @@ def get_courses_data():
                 courses.append(course)
         return courses
     else:
-        data = fetch_sheet_csv(GSHEET_COURSES_NAME)
+        data = fetch_sheet_csv(courses_name, gsheet_id)
         if len(data) < 2:
             return []
         headers = [h.strip() for h in data[0]]
@@ -108,18 +130,33 @@ def get_courses_data():
             })
         return courses
 
-def get_texts_data():
-    if GOOGLE_SHEETS_USE_API:
+def get_texts_data(bot_name: str = None):
+    """
+    Get texts data from Google Sheets.
+    If bot_name is provided, uses configuration for that bot.
+    Otherwise, tries to get bot_name from context, or uses current bot configuration.
+    """
+    if bot_name is None:
+        from bot_context import get_bot_context
+        bot_name = get_bot_context() or CURRENT_BOT_NAME
+    
+    config = get_bot_config(bot_name)
+    gsheet_id = config['GSHEET_ID']
+    texts_name = config['GSHEET_TEXTS_NAME']
+    use_api = config['GOOGLE_SHEETS_USE_API']
+    credentials_file = config['GOOGLE_CREDENTIALS_FILE']
+    
+    if use_api:
         try:
             import gspread
             from oauth2client.service_account import ServiceAccountCredentials
         except ImportError:
             raise RuntimeError("gspread/oauth2client not installed. Set GOOGLE_SHEETS_USE_API=False or install libs.")
         scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive.readonly"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_CREDENTIALS_FILE, scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_name(credentials_file, scope)
         client = gspread.authorize(creds)
-        sheet = client.open_by_key(GSHEET_ID)
-        ws = sheet.worksheet(GSHEET_TEXTS_NAME)
+        sheet = client.open_by_key(gsheet_id)
+        ws = sheet.worksheet(texts_name)
         data = ws.get_all_values()
         texts = {}
         for row in data:
@@ -127,7 +164,7 @@ def get_texts_data():
                 texts[row[0]] = row[1]
         return texts
     else:
-        data = fetch_sheet_csv(GSHEET_TEXTS_NAME)
+        data = fetch_sheet_csv(texts_name, gsheet_id)
         texts = {}
         if not data or len(data) < 2:
             return texts

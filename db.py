@@ -2,18 +2,53 @@
 import sqlite3
 import time
 
-from config import DATABASE_PATH
+from config import DATABASE_PATH, get_bot_config
+from bot_context import get_bot_context
 
-_conn = None
+# Dictionary to store connections per bot
+_connections = {}
 
-def get_connection():
-    global _conn
-    if _conn is None:
-        _conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        _conn.execute("PRAGMA foreign_keys = ON;")
-        _conn.row_factory = sqlite3.Row
-        init_db(_conn)
-    return _conn
+def get_connection(bot_name: str = None, database_path: str = None):
+    """
+    Get database connection for a specific bot.
+    If bot_name is provided, uses configuration for that bot.
+    If database_path is provided, uses that path directly.
+    Otherwise, tries to get bot_name from context, or uses current bot configuration.
+    """
+    # Determine which database to use
+    if database_path:
+        db_path = database_path
+        cache_key = db_path
+    elif bot_name:
+        config = get_bot_config(bot_name)
+        db_path = config['DATABASE_PATH']
+        cache_key = bot_name
+    else:
+        # Try to get bot_name from context
+        context_bot_name = get_bot_context()
+        if context_bot_name:
+            config = get_bot_config(context_bot_name)
+            db_path = config['DATABASE_PATH']
+            cache_key = context_bot_name
+        else:
+            # Fallback to default
+            db_path = DATABASE_PATH
+            cache_key = 'default'
+    
+    # Return cached connection if available
+    if cache_key in _connections:
+        return _connections[cache_key]
+    
+    # Create new connection
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.execute("PRAGMA foreign_keys = ON;")
+    conn.row_factory = sqlite3.Row
+    init_db(conn)
+    
+    # Cache connection
+    _connections[cache_key] = conn
+    
+    return conn
 
 def init_db(conn):
     cur = conn.cursor()
