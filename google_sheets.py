@@ -48,6 +48,16 @@ def get_courses_data():
                 "image_url": (rec.get("image_url") or rec.get("Image") or rec.get("Картинка") or "").strip(),
                 "channel": (rec.get("channel") or rec.get("Channel") or rec.get("Канал") or "").strip(),
             }
+            # Parse is_active: 1/True/"1"/"true" = active, 0/False/"0"/"false"/empty = inactive
+            is_active_raw = rec.get("is_active") or rec.get("Is Active") or rec.get("isActive") or rec.get("Активен") or rec.get("active") or "1"
+            if isinstance(is_active_raw, bool):
+                course["is_active"] = 1 if is_active_raw else 0
+            elif isinstance(is_active_raw, (int, float)):
+                course["is_active"] = 1 if int(is_active_raw) == 1 else 0
+            else:
+                is_active_str = str(is_active_raw).strip().lower()
+                course["is_active"] = 1 if is_active_str in ("1", "true", "yes", "да", "y") else 0
+            
             if course["id"]:
                 courses.append(course)
         return courses
@@ -70,12 +80,22 @@ def get_courses_data():
             duration = d.get("duration_days") or d.get("Duration") or d.get("Срок") or d.get("duration_minutes") or ""
             image = (d.get("image_url") or d.get("Image") or d.get("Картинка") or "").strip()
             channel = (d.get("channel") or d.get("Channel") or d.get("Канал") or "").strip()
+            # Parse is_active from column H (index 7) or by name
+            is_active_raw = d.get("is_active") or d.get("Is Active") or d.get("isActive") or d.get("Активен") or d.get("active") or "1"
             try:
                 price = float(str(price).replace(",", ".") if price else 0)
             except (ValueError, TypeError):
                 price = 0.0
             # Если duration пустой или 0, то None (бессрочный доступ)
             duration = parse_duration(duration)
+            # Parse is_active: 1/True/"1"/"true" = active, 0/False/"0"/"false"/empty = inactive
+            if isinstance(is_active_raw, bool):
+                is_active = 1 if is_active_raw else 0
+            elif isinstance(is_active_raw, (int, float)):
+                is_active = 1 if int(is_active_raw) == 1 else 0
+            else:
+                is_active_str = str(is_active_raw).strip().lower()
+                is_active = 1 if is_active_str in ("1", "true", "yes", "да", "y") else 0
             courses.append({
                 "id": course_id,
                 "name": name,
@@ -83,7 +103,8 @@ def get_courses_data():
                 "price": price,
                 "duration_days": duration,
                 "image_url": image,
-                "channel": channel
+                "channel": channel,
+                "is_active": is_active
             })
         return courses
 

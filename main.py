@@ -804,7 +804,10 @@ def send_catalog_message(user_id, edit_message=None, edit_message_id=None, edit_
         print("Error fetching courses:", e)
         return
     
-    if not courses:
+    # Filter courses by is_active: only show courses with is_active == 1
+    active_courses = [c for c in courses if c.get("is_active", 1) == 1]
+    
+    if not active_courses:
         empty_msg = "Каталог пока пуст."
         if edit_message:
             try:
@@ -816,7 +819,7 @@ def send_catalog_message(user_id, edit_message=None, edit_message_id=None, edit_
         return
 
     kb = types.InlineKeyboardMarkup()
-    for c in courses:
+    for c in active_courses:
         cid = str(c.get("id"))
         name = c.get("name", "Курс")
         # Strip HTML from button labels (buttons don't support HTML formatting)
@@ -1142,6 +1145,11 @@ def cb_course(c: telebot.types.CallbackQuery):
     if not course:
         bot.answer_callback_query(c.id, "Курс не найден.", show_alert=True)
         return
+    
+    # Check if course is active (is_active == 1)
+    if course.get("is_active", 1) != 1:
+        bot.answer_callback_query(c.id, "Этот курс временно недоступен.", show_alert=True)
+        return
 
     name = course.get("name", "")
     desc = course.get("description", "")
@@ -1283,6 +1291,10 @@ def cb_buy(c: telebot.types.CallbackQuery):
     if not course:
         bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
         return
+    # Check if course is active (is_active == 1)
+    if course.get("is_active", 1) != 1:
+        bot.answer_callback_query(c.id, "Этот курс временно недоступен для покупки.", show_alert=True)
+        return
     if has_active_subscription(user_id, str(course_id)):
         bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
         return
@@ -1318,6 +1330,10 @@ def cb_pay_yk(c: telebot.types.CallbackQuery):
     course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
     if not course:
         bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
+        return
+    # Check if course is active (is_active == 1)
+    if course.get("is_active", 1) != 1:
+        bot.answer_callback_query(c.id, "Этот курс временно недоступен для покупки.", show_alert=True)
         return
     if has_active_subscription(user_id, str(course_id)):
         bot.answer_callback_query(c.id, "У вас уже есть этот курс.", show_alert=True)
@@ -1412,6 +1428,11 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
     course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
     if not course:
         bot.answer_callback_query(c.id, COURSE_NOT_AVAILABLE_MSG, show_alert=True)
+        return
+    
+    # Check if course is active (is_active == 1)
+    if course.get("is_active", 1) != 1:
+        bot.answer_callback_query(c.id, "Этот курс временно недоступен для покупки.", show_alert=True)
         return
     
     if has_active_subscription(user_id, str(course_id)):
