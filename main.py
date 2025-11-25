@@ -16,7 +16,7 @@ from db import add_user, get_user, add_purchase, get_active_subscriptions, has_a
 from google_sheets import get_courses_data, get_texts_data
 from bot_context import get_bot_context
 from bot_factory import get_bot_instance
-from prodamuspy import ProdamusPy
+from prodamuspy import ProdamusPy  # type: ignore
 
 # Create default bot instance (for backward compatibility)
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN, parse_mode=None, threaded=False)
@@ -231,6 +231,128 @@ def verify_prodamus_signature(data: dict, secret_key: str, signature: str) -> bo
         print(f"[Prodamus] Signature verification error: {e}")
         return False
 
+def generate_prodamus_payment_url(order_number: str, amount: float, product_name: str, customer_email: str = "", customer_phone: str = "", extra_params: dict = None) -> str:
+    """
+    Build payment URL for Prodamus payform.
+    """
+    config = get_current_payment_config()
+    base_url = config.get('PRODAMUS_PAYFORM_URL') or PRODAMUS_PAYFORM_URL
+    if not base_url:
+        raise RuntimeError("PRODAMUS_PAYFORM_URL is not configured")
+    if not base_url.startswith("http"):
+        base_url = f"https://{base_url}"
+    params = {
+        "old_auth": 1,
+        "order": order_number,
+        "sum": rub_str(amount),
+        "description": strip_html(product_name) if product_name else "Курс",
+    }
+    system_id = config.get("PRODAMUS_SYSTEM_ID")
+    if system_id:
+        params["system_id"] = system_id
+    if customer_email:
+        params["customer_email"] = customer_email
+    if customer_phone:
+        params["customer_phone"] = customer_phone
+    if extra_params:
+        params.update(extra_params)
+    return f"{base_url}?{urlencode(params)}"
+
+# --- Text templates and helpers ---
+ALREADY_PURCHASED_MSG = "Этот курс уже активен у вас."
+COURSE_NOT_AVAILABLE_MSG = "Курс временно недоступен. Обратитесь в поддержку."
+PURCHASE_SUCCESS_MSG = "✅ Оплата прошла!\nДоступ к курсу «{course_name}» открыт."
+PURCHASE_RECEIPT_MSG = "Квитанция отправлена на email, указанный при оплате."
+CATALOG_INTRO_DEFAULT = "📚 <b>Каталог курсов</b>\nВыберите интересующий курс:"
+CATALOG_EMPTY_DEFAULT = "Каталог пока пуст. Загляните позже."
+CATALOG_ERROR_DEFAULT = "Не удалось загрузить каталог. Попробуйте позже."
+SUPPORT_TEXT_DEFAULT = "Напишите нам в поддержку: @your_support или info@example.com"
+NO_ACTIVE_SUBS_DEFAULT = "У вас пока нет активных подписок."
+ACTIVE_SUBS_HEADER_DEFAULT = "📘 Ваши активные курсы:"
+
+_texts_cache = {}
+_TEXTS_CACHE_TTL = 300  # seconds
+
+def _get_texts_for_bot(bot_name: str) -> dict:
+    now = time.time()
+    cached = _texts_cache.get(bot_name)
+    if cached and now - cached["ts"] < _TEXTS_CACHE_TTL:
+        return cached["data"]
+    try:
+        data = get_texts_data(bot_name) or {}
+    except Exception as e:
+        print(f"[Texts] Failed to load texts for {bot_name}: {e}")
+        data = {}
+    _texts_cache[bot_name] = {"ts": now, "data": data}
+    return data
+
+def get_text_value(key: str, default: str = "") -> str:
+    bot_name = get_bot_context() or CURRENT_BOT_NAME
+    texts = _get_texts_for_bot(bot_name)
+    value = texts.get(key)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return default
+
+def build_main_menu(user_id: int) -> types.ReplyKeyboardMarkup:
+    keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    keyboard.row("Каталог", "Активные подписки")
+    keyboard.row("Поддержка", "Оферта")
+    admin_ids = get_current_admin_ids()
+    if user_id in admin_ids:
+        keyboard.row("📊 Все подписки", "📋 Google Sheets")
+        keyboard.add("📢 Рассылка")
+    return keyboard
+
+def send_catalog_message(user_id: int, edit_message: telebot.types.Message = None, edit_message_id: int = None, edit_chat_id: int = None):
+    current_bot = get_current_bot()
+    try:
+        courses = get_courses_data()
+    except Exception as e:
+        print(f"Catalog load error: {e}")
+        current_bot.send_message(user_id, get_text_value("catalog_error", CATALOG_ERROR_DEFAULT))
+        return
+    active_courses = [c for c in courses if c.get("is_active", 1) == 1]
+    if not active_courses:
+        current_bot.send_message(user_id, get_text_value("catalog_empty", CATALOG_EMPTY_DEFAULT))
+        return
+    intro_text = format_text_for_telegram(get_text_value("catalog_intro", CATALOG_INTRO_DEFAULT))
+    kb = types.InlineKeyboardMarkup()
+    for course in active_courses:
+        course_id = course.get("id")
+        if not course_id:
+            continue
+        name = strip_html(course.get("name") or "Курс")
+        price = course.get("price")
+        label = name
+        try:
+            if price not in (None, ""):
+                price_val = float(price)
+                if price_val > 0:
+                    label = f"{name} • {int(price_val)}₽"
+        except (TypeError, ValueError):
+            pass
+        kb.add(types.InlineKeyboardButton(label[:64], callback_data=f"course_{course_id}"))
+    text = f"{intro_text}\n\nДоступно курсов: {len(active_courses)}"
+    target_chat = edit_chat_id or (edit_message.chat.id if edit_message else None)
+    target_msg = edit_message_id or (edit_message.message_id if edit_message else None)
+    if target_chat and target_msg:
+        try:
+            current_bot.edit_message_text(text, chat_id=target_chat, message_id=target_msg, reply_markup=kb, parse_mode='HTML')
+            return
+        except Exception as e:
+            print(f"Failed to edit catalog message: {e}")
+    current_bot.send_message(user_id, text, reply_markup=kb, parse_mode='HTML')
+
+def ensure_user_record(user: telebot.types.User):
+    if not user:
+        return
+    username = user.username if getattr(user, "username", None) else None
+    try:
+        add_user(user.id, username)
+    except Exception as e:
+        print(f"add_user error: {e}")
+
 # --- Webhook / WSGI (PythonAnywhere) support ---
 # Import webhook config from config.py (already processed and normalized)
 try:
@@ -319,24 +441,24 @@ def prodamus_result():
         print(f"[Prodamus Result] Payload: {data}")
 
         forward_to_test_webhook("result", data, request.method)
-
+        
         if secret_key:
             if not verify_prodamus_signature(data, secret_key, signature):
                 print("[Prodamus Result] Invalid signature")
                 return "ERROR: Invalid signature", 400
-
+        
         order_number = data.get("order_num") or data.get("order_id") or data.get("order")
         amount = data.get("sum") or data.get("amount")
         payment_status = (data.get("payment_status") or data.get("payment_status_description") or data.get("status") or "").lower()
-
+        
         if not order_number or not amount:
             print(f"[Prodamus Result] Missing required parameters. Received data: {data}")
             return "ERROR: Missing parameters", 400
-
+        
         if payment_status not in ("success", "paid", "successful"):
             print(f"[Prodamus Result] Payment not successful, status: {payment_status}")
             return "OK", 200
-
+        
         try:
             conn = sqlite3.connect(get_current_config()['DATABASE_PATH'])
             cur = conn.cursor()
@@ -361,18 +483,18 @@ def prodamus_result():
                 pass
             cur.execute("SELECT user_id, course_id, amount FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
             row = cur.fetchone()
-
+            
             if not row:
                 print(f"[Prodamus Result] Payment not found for order/invoice {order_number}")
                 conn.close()
                 return "ERROR: Payment not found", 404
-
+            
             user_id, course_id, expected_amount = row
             if abs(float(amount) - float(expected_amount)) > 0.01:
                 print(f"[Prodamus Result] Amount mismatch for order {order_number}: expected {expected_amount}, got {amount}")
                 conn.close()
                 return "ERROR: Amount mismatch", 400
-
+            
             try:
                 courses = get_courses_data()
                 course = next((x for x in courses if str(x.get("id")) == str(course_id)), None)
@@ -380,22 +502,22 @@ def prodamus_result():
                     print(f"[Prodamus Result] Course {course_id} not found")
                     conn.close()
                     return "ERROR: Course not found", 404
-
+                
                 course_name = course.get("name", f"ID {course_id}")
                 duration = course.get("duration_days")
                 channel = str(course.get("channel", ""))
-
+                
                 add_user(user_id, None)
-
+                
                 add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"prodamus_{order_number}")
 
                 cur.execute("DELETE FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
                 conn.commit()
                 conn.close()
-
+                
                 clean_course_name = strip_html(course_name) if course_name else f"ID {course_id}"
                 text = f"✅ Оплата успешно получена!\n\nВам предоставлен доступ к курсу: {clean_course_name}"
-
+                
                 invite_link = None
                 if channel:
                     try:
@@ -408,21 +530,21 @@ def prodamus_result():
                         invite_link = invite.invite_link
                     except Exception as e:
                         print(f"create_chat_invite_link failed for {channel}: {e}")
-
+                
                 if invite_link:
                     kb = types.InlineKeyboardMarkup()
                     kb.add(types.InlineKeyboardButton("Перейти в канал курса", url=invite_link))
                     current_bot.send_message(user_id, text, reply_markup=kb)
                 else:
                     current_bot.send_message(user_id, text)
-
+                
                 admin_text = f"💰 Оплата Prodamus: пользователь {user_id} купил {clean_course_name} на сумму {amount} руб. (Order: {order_number})"
                 for admin_id in get_current_admin_ids():
                     try:
                         current_bot.send_message(admin_id, admin_text)
                     except Exception:
                         pass
-
+                
                 print(f"[Prodamus Result] ✅ Payment processed: user {user_id}, course {course_id}")
                 return "OK", 200
             except Exception as e:
@@ -554,6 +676,78 @@ def handle_prodamus_email(message: telebot.types.Message):
         print(f"Error generating Prodamus payment URL: {error_msg}")
         current_bot.send_message(user_id, "❌ Ошибка при создании ссылки на оплату. Пожалуйста, попробуйте позже или обратитесь в поддержку.")
 
+
+# Basic user-facing handlers
+@bot.message_handler(commands=['start'])
+def handle_start(message: telebot.types.Message):
+    current_bot = get_current_bot()
+    user_id = message.from_user.id
+    ensure_user_record(message.from_user)
+    greeting = format_text_for_telegram(get_text_value("greeting_text", "Привет! Я помогу выбрать и оплатить курс."))
+    current_bot.send_message(user_id, greeting, parse_mode='HTML', reply_markup=build_main_menu(user_id))
+    send_catalog_message(user_id)
+
+@bot.message_handler(func=lambda m: m.text == "Каталог")
+def handle_catalog(message: telebot.types.Message):
+    ensure_user_record(message.from_user)
+    send_catalog_message(message.from_user.id)
+
+@bot.message_handler(func=lambda m: m.text == "Активные подписки")
+def handle_active(message: telebot.types.Message):
+    current_bot = get_current_bot()
+    user_id = message.from_user.id
+    ensure_user_record(message.from_user)
+    subscriptions = get_active_subscriptions(user_id) or []
+    if not subscriptions:
+        current_bot.send_message(
+            user_id,
+            get_text_value("no_active_subscriptions", NO_ACTIVE_SUBS_DEFAULT),
+            reply_markup=build_main_menu(user_id)
+        )
+        return
+    header = get_text_value("active_subscriptions_header", ACTIVE_SUBS_HEADER_DEFAULT)
+    lines = [header, ""]
+    links_keyboard = types.InlineKeyboardMarkup()
+    has_links = False
+    for idx, sub in enumerate(subscriptions, start=1):
+        course_name = strip_html(sub["course_name"]) if sub["course_name"] else "Курс"
+        expiry = sub["expiry"]
+        if expiry and expiry > 0:
+            expiry_text = datetime.datetime.fromtimestamp(expiry).strftime("%d.%m.%Y")
+        else:
+            expiry_text = "бессрочно"
+        lines.append(f"{idx}. {course_name} — доступ до {expiry_text}")
+        channel_id = sub["channel_id"]
+        if channel_id:
+            channel_str = str(channel_id)
+            button_label = f"Открыть «{course_name[:20]}»"
+            if channel_str.startswith("@"):
+                links_keyboard.add(types.InlineKeyboardButton(button_label, url=f"https://t.me/{channel_str[1:]}"))
+                has_links = True
+            else:
+                try:
+                    expire_date = datetime.datetime.now() + datetime.timedelta(days=1)
+                    invite = current_bot.create_chat_invite_link(
+                        chat_id=channel_str,
+                        member_limit=1,
+                        expire_date=expire_date
+                    )
+                    links_keyboard.add(types.InlineKeyboardButton(button_label, url=invite.invite_link))
+                    has_links = True
+                except Exception as e:
+                    print(f"Invite link error for {channel_id}: {e}")
+    text = "\n".join(lines)
+    current_bot.send_message(user_id, text, reply_markup=build_main_menu(user_id))
+    if has_links:
+        current_bot.send_message(user_id, "Быстрые ссылки на каналы:", reply_markup=links_keyboard)
+
+@bot.message_handler(func=lambda m: m.text == "Поддержка")
+def handle_support(message: telebot.types.Message):
+    current_bot = get_current_bot()
+    user_id = message.from_user.id
+    ensure_user_record(message.from_user)
+    support_text = format_text_for_telegram(get_text_value("support_text", SUPPORT_TEXT_DEFAULT))
+    current_bot.send_message(user_id, support_text, parse_mode='HTML', reply_markup=build_main_menu(user_id))
 
 # Handler for "Оферта" button
 @bot.message_handler(func=lambda m: m.text == "Оферта")
