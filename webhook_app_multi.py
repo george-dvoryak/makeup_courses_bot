@@ -360,7 +360,15 @@ for bot_name in bots.keys():
                     add_user(user_id, "")
                     
                     # Add purchase
-                    add_purchase(user_id, course_id, duration_days, channel_id)
+                    payment_id = f"prodamus_{order_number}"
+                    add_purchase(
+                        user_id,
+                        course_id,
+                        course_name,
+                        channel_id,
+                        duration_days,
+                        payment_id=payment_id
+                    )
                     
                     # Delete pending payment
                     cur.execute("DELETE FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
@@ -445,7 +453,18 @@ for bot_name in bots.keys():
                                 course = next((c for c in courses if str(c.get("id")) == str(course_id)), None)
                                 if course:
                                     add_user(user_id, "")
-                                    add_purchase(user_id, course_id, course.get("duration_days"), course.get("channel_id"))
+                                    course_name = course.get("name", "Курс")
+                                    duration_days = course.get("duration_days")
+                                    channel_id = course.get("channel_id")
+                                    payment_id = f"prodamus_{payform_order_id}"
+                                    add_purchase(
+                                        user_id,
+                                        course_id,
+                                        course_name,
+                                        channel_id,
+                                        duration_days,
+                                        payment_id=payment_id
+                                    )
                                     cur.execute("DELETE FROM pending_payments WHERE order_id = ?", (payform_order_id,))
                                     conn.commit()
                                     

@@ -45,7 +45,7 @@ def get_current_config():
 def get_current_admin_ids():
     """Get current bot's admin IDs"""
     config = get_current_config()
-    return config.get('get_current_admin_ids()', get_current_admin_ids())
+    return config.get('ADMIN_IDS', ADMIN_IDS)
 
 # Helper function to get current payment config
 def get_current_payment_config():
@@ -871,7 +871,6 @@ main_menu_keyboard.add(btn_oferta)
 @bot.message_handler(commands=['start'])
 def handle_start(message: telebot.types.Message):
     current_bot = get_current_bot()
-    current_bot = get_current_bot()
     user_id = message.from_user.id
     username = message.from_user.username or ""
     add_user(user_id, username)
@@ -918,7 +917,6 @@ def handle_start(message: telebot.types.Message):
             print(f"Failed to send welcome message to user {user_id}: {e}")
 
 def send_catalog_message(user_id, edit_message=None, edit_message_id=None, edit_chat_id=None):
-    current_bot = get_current_bot()
     """Helper function to send/update catalog message"""
     current_bot = get_current_bot()
     texts = get_texts_data()
@@ -994,7 +992,6 @@ def handle_catalog(message: telebot.types.Message):
 @bot.message_handler(func=lambda m: m.text == "Активные подписки")
 def handle_active(message: telebot.types.Message):
     current_bot = get_current_bot()
-    current_bot = get_current_bot()
     user_id = message.from_user.id
     subs = get_active_subscriptions(user_id)
     subs = list(subs) if subs else []
@@ -1059,7 +1056,6 @@ def handle_support(message: telebot.types.Message):
 # Handler for email input for Prodamus payments
 @bot.message_handler(func=lambda m: m.from_user.id in get_prodamus_pending_emails())
 def handle_prodamus_email(message: telebot.types.Message):
-    current_bot = get_current_bot()
     current_bot = get_current_bot()
     current_config = get_current_config()
     prodamus_emails = get_prodamus_pending_emails()
@@ -1631,7 +1627,8 @@ def cb_pay_prodamus(c: telebot.types.CallbackQuery):
     # If no email, request it from user
     if not customer_email:
         # Store payment info in memory to continue after email is received
-        prodamus_pending_emails[user_id] = {
+        prodamus_emails = get_prodamus_pending_emails()
+        prodamus_emails[user_id] = {
             "course_id": course_id,
             "order_id": order_id,
             "price": price,
@@ -2123,14 +2120,16 @@ def send_broadcast_messages(recipients: list, text: str, photo_file_id: str = No
     return sent, failed
 
 # Admin broadcast handler - button in menu
-@bot.message_handler(func=lambda m: m.text == "📢 Рассылка" and m.from_user.id in ADMIN_IDS)
+# Note: We can't use get_current_admin_ids() in decorator directly, so we check in function body
+@bot.message_handler(func=lambda m: m.text == "📢 Рассылка")
 def handle_broadcast_button(message: telebot.types.Message):
     current_bot = get_current_bot()
     """Show broadcast type selection"""
     user_id = message.from_user.id
     
     # Reset broadcast state
-    admin_broadcast_state[user_id] = {"type": None, "text": None, "photo": None}
+    broadcast_state = get_admin_broadcast_state()
+    broadcast_state[user_id] = {"type": None, "text": None, "photo": None}
     
     text = "📢 Выберите тип рассылки:"
     kb = types.InlineKeyboardMarkup()
@@ -2153,9 +2152,10 @@ def cb_broadcast_type(c: telebot.types.CallbackQuery):
     broadcast_type = c.data.split("_")[-1]  # all, buyers, nonbuyers
     
     # Initialize broadcast state
-    if user_id not in admin_broadcast_state:
-        admin_broadcast_state[user_id] = {}
-    admin_broadcast_state[user_id]["type"] = broadcast_type
+    broadcast_state = get_admin_broadcast_state()
+    if user_id not in broadcast_state:
+        broadcast_state[user_id] = {}
+    broadcast_state[user_id]["type"] = broadcast_type
     
     type_names = {
         "all": "всем пользователям",
@@ -2177,24 +2177,31 @@ def cb_broadcast_type(c: telebot.types.CallbackQuery):
 def cb_broadcast_cancel(c: telebot.types.CallbackQuery):
     current_bot = get_current_bot()
     user_id = c.from_user.id
-    if user_id in admin_broadcast_state:
-        del admin_broadcast_state[user_id]
+    broadcast_state = get_admin_broadcast_state()
+    if user_id in broadcast_state:
+        del broadcast_state[user_id]
     
     current_bot.edit_message_text("❌ Рассылка отменена.", chat_id=c.message.chat.id, message_id=c.message.message_id)
     current_bot.answer_callback_query(c.id)
 
 # Handle text message for broadcast
 # This handler must be before other text handlers to catch broadcast text
-@bot.message_handler(func=lambda m: m.from_user.id in admin_broadcast_state and m.from_user.id in ADMIN_IDS and m.text and not m.text.startswith("/") and m.text not in ["Каталог", "Активные подписки", "Поддержка", "Оферта", "📊 Все подписки", "📋 Google Sheets", "📢 Рассылка"])
+# Note: We check admin_broadcast_state in decorator, but check admin status in function body
+@bot.message_handler(func=lambda m: m.text and not m.text.startswith("/") and m.text not in ["Каталог", "Активные подписки", "Поддержка", "Оферта", "📊 Все подписки", "📋 Google Sheets", "📢 Рассылка"])
 def handle_broadcast_text(message: telebot.types.Message):
     current_bot = get_current_bot()
     """Handle text input for broadcast"""
     user_id = message.from_user.id
     
-    if user_id not in admin_broadcast_state:
+    # Check if user is in broadcast state and is admin for current bot
+    broadcast_state = get_admin_broadcast_state()
+    if user_id not in broadcast_state:
         return
     
-    state = admin_broadcast_state[user_id]
+    if user_id not in get_current_admin_ids():
+        return
+    
+    state = broadcast_state[user_id]
     
     if state.get("type") is None:
         return
@@ -2218,16 +2225,22 @@ def handle_broadcast_text(message: telebot.types.Message):
         current_bot.send_message(user_id, text, reply_markup=kb)
 
 # Handle photo for broadcast
-@bot.message_handler(func=lambda m: m.from_user.id in admin_broadcast_state and m.from_user.id in ADMIN_IDS and m.photo, content_types=['photo'])
+# Note: We check admin_broadcast_state in decorator, but check admin status in function body
+@bot.message_handler(func=lambda m: m.photo, content_types=['photo'])
 def handle_broadcast_photo(message: telebot.types.Message):
     current_bot = get_current_bot()
     """Handle photo input for broadcast"""
     user_id = message.from_user.id
     
-    if user_id not in admin_broadcast_state:
+    # Check if user is in broadcast state and is admin for current bot
+    broadcast_state = get_admin_broadcast_state()
+    if user_id not in broadcast_state:
         return
     
-    state = admin_broadcast_state[user_id]
+    if user_id not in get_current_admin_ids():
+        return
+    
+    state = broadcast_state[user_id]
     
     if state.get("type") is None:
         return
@@ -2258,11 +2271,12 @@ def cb_broadcast_send(c: telebot.types.CallbackQuery):
         current_bot.answer_callback_query(c.id, "У вас нет доступа.")
         return
     
-    if user_id not in admin_broadcast_state:
+    broadcast_state = get_admin_broadcast_state()
+    if user_id not in broadcast_state:
         current_bot.answer_callback_query(c.id, "Ошибка: состояние рассылки не найдено.")
         return
     
-    state = admin_broadcast_state[user_id]
+    state = broadcast_state[user_id]
     
     if not state.get("text"):
         current_bot.answer_callback_query(c.id, "Ошибка: текст сообщения не указан.")
@@ -2312,8 +2326,9 @@ def execute_broadcast(user_id: int, state: dict):
     if not recipients:
         current_bot.send_message(user_id, "❌ Получатели не найдены.")
         # Clear state
-        if user_id in admin_broadcast_state:
-            del admin_broadcast_state[user_id]
+        broadcast_state = get_admin_broadcast_state()
+        if user_id in broadcast_state:
+            del broadcast_state[user_id]
         return
     
     # Send progress message
@@ -2336,8 +2351,9 @@ def execute_broadcast(user_id: int, state: dict):
     current_bot.edit_message_text(stats_text, chat_id=progress_msg.chat.id, message_id=progress_msg.message_id)
     
     # Clear state
-    if user_id in admin_broadcast_state:
-        del admin_broadcast_state[user_id]
+    broadcast_state = get_admin_broadcast_state()
+    if user_id in broadcast_state:
+        del broadcast_state[user_id]
 
 
 def remove_user_from_channel(user_id: int, channel_id: str):
