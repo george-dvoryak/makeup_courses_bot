@@ -89,7 +89,19 @@ def get_bot_config(bot_name: str = None) -> dict:
     
     # === Admins ===
     admin_ids_str = get_bot_env("ADMIN_IDS", required=True)
-    config['ADMIN_IDS'] = [int(x.strip()) for x in admin_ids_str.split(",") if x.strip()]
+    # Validate and parse admin IDs, skip invalid values (like placeholders)
+    admin_ids = []
+    if admin_ids_str:
+        for x in admin_ids_str.split(","):
+            x = x.strip()
+            if x:
+                try:
+                    admin_id = int(x)
+                    admin_ids.append(admin_id)
+                except ValueError:
+                    # Skip invalid values (placeholders like "ваш_telegram_id")
+                    continue
+    config['ADMIN_IDS'] = admin_ids
     
     # === Webhook (PythonAnywhere) ===
     config['USE_WEBHOOK'] = get_bot_bool_env("USE_WEBHOOK", False)
@@ -143,7 +155,42 @@ def get_available_bots() -> list:
     return bots
 
 # Get configuration for current bot (for backward compatibility)
-_current_config = get_bot_config(CURRENT_BOT_NAME)
+# Try to load default bot, fallback to first available bot if default doesn't exist or has invalid config
+try:
+    _current_config = get_bot_config(CURRENT_BOT_NAME)
+    # Validate that config has valid token (not a placeholder)
+    if not _current_config.get('TELEGRAM_BOT_TOKEN') or 'ваш' in _current_config.get('TELEGRAM_BOT_TOKEN', '').lower():
+        raise ValueError("Default bot has placeholder values")
+except (ValueError, KeyError):
+    # Fallback to first available bot
+    available_bots = get_available_bots()
+    if available_bots:
+        _current_config = get_bot_config(available_bots[0])
+    else:
+        # Last resort: create minimal config
+        _current_config = {
+            'TELEGRAM_BOT_TOKEN': '',
+            'ADMIN_IDS': [],
+            'DATABASE_PATH': 'bot.db',
+            'PAYMENT_PROVIDER_TOKEN': '',
+            'CURRENCY': 'RUB',
+            'ENABLE_PRODAMUS': False,
+            'PRODAMUS_TEST_MODE': False,
+            'PRODAMUS_PAYFORM_URL': '',
+            'PRODAMUS_SECRET_KEY': '',
+            'PRODAMUS_SYSTEM_ID': '',
+            'PRODAMUS_TEST_WEBHOOK_URL': '',
+            'USE_WEBHOOK': False,
+            'WEBHOOK_HOST': '',
+            'WEBHOOK_SECRET_TOKEN': '',
+            'WEBHOOK_URL': '',
+            'WEBHOOK_PATH': '',
+            'GSHEET_ID': '',
+            'GSHEET_COURSES_NAME': 'Courses',
+            'GSHEET_TEXTS_NAME': 'Texts',
+            'GOOGLE_SHEETS_USE_API': False,
+            'GOOGLE_CREDENTIALS_FILE': 'google_credentials.json',
+        }
 
 # Export current bot configuration as module-level variables (for backward compatibility)
 TELEGRAM_BOT_TOKEN = _current_config['TELEGRAM_BOT_TOKEN']
