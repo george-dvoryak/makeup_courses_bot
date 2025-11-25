@@ -202,15 +202,54 @@ def check_webhook_app():
         traceback.print_exc()
 
 
+def find_wsgi_candidates():
+    candidates = []
+    domain_env = os.environ.get("PYTHONANYWHERE_DOMAIN")
+    if domain_env:
+        slug = domain_env.replace(".", "_").replace("-", "_")
+        candidates.append(Path(f"/var/www/{slug}_wsgi.py"))
+
+    # Try to derive from configured webhook hosts
+    try:
+        from config import get_available_bots, get_bot_config
+
+        for bot_name in get_available_bots():
+            host = get_bot_config(bot_name).get("WEBHOOK_HOST")
+            if host:
+                slug = host.replace(".", "_").replace("-", "_")
+                candidates.append(Path(f"/var/www/{slug}_wsgi.py"))
+    except Exception:
+        pass
+
+    # Add generic glob matches
+    candidates.extend(sorted(Path("/var/www").glob("*pythonanywhere_com_wsgi.py")))
+
+    # Remove duplicates while preserving order
+    unique = []
+    seen = set()
+    for path in candidates:
+        if path and path not in seen:
+            unique.append(path)
+            seen.add(path)
+    return unique
+
+
 def check_wsgi():
     print_header("8. ПРОВЕРКА WSGI ФАЙЛА")
-    domain = os.environ.get("PYTHONANYWHERE_DOMAIN", "manybot-goshadvoryak.pythonanywhere.com")
-    wsgi_name = domain.replace(".", "_").replace("-", "_")
-    wsgi_path = Path(f"/var/www/{wsgi_name}_wsgi.py")
-    if not wsgi_path.exists():
-        print(f"❌ WSGI файл не найден: {wsgi_path}")
+    candidates = find_wsgi_candidates()
+    existing = [p for p in candidates if p.exists()]
+
+    if not existing:
+        print("❌ Ни одного WSGI файла не найдено в /var/www/*pythonanywhere_com_wsgi.py")
+        print("   Проверьте правильность домена в настройках Web → WSGI configuration file.")
+        if candidates:
+            print("   Проверены пути:")
+            for cand in candidates[:5]:
+                print(f"     - {cand}")
         return
-    print(f"✅ WSGI файл существует: {wsgi_path}")
+
+    wsgi_path = existing[0]
+    print(f"✅ Используем WSGI файл: {wsgi_path}")
     try:
         content = wsgi_path.read_text()
         print(f"   Размер: {len(content)} байт")
@@ -310,7 +349,7 @@ def test_http_endpoints(bots):
             print(f"  ❌ Ошибка обращения к webhook: {e}")
 
 
-def check_environment():
+def check_environment(bots):
     print_header("11. ПРОВЕРКА КЛЮЧЕВЫХ ENV ПЕРЕМЕННЫХ")
     keys = [
         "BOTS_LIST",
@@ -327,6 +366,22 @@ def check_environment():
             print(f"  ✅ {key}: {mask(value)}")
         else:
             print(f"  ✅ {key}: {value}")
+
+    if not bots:
+        return
+
+    print("\nПеременные из конфигурации ботов:")
+    from config import get_bot_config
+
+    for bot_name in bots:
+        cfg = get_bot_config(bot_name)
+        print(f"  Бот {bot_name}:")
+        host = cfg.get("WEBHOOK_HOST") or "<не задан>"
+        path = cfg.get("WEBHOOK_PATH") or f"/webhook/{bot_name}"
+        secret = cfg.get("WEBHOOK_SECRET_TOKEN")
+        print(f"    WEBHOOK_HOST        : {host}")
+        print(f"    WEBHOOK_PATH        : {path}")
+        print(f"    WEBHOOK_SECRET_TOKEN: {mask(secret) if secret else '<empty>'}")
 
 
 def main():
@@ -346,7 +401,7 @@ def main():
         test_http_endpoints(bots)
     else:
         print("\n⚠️ Боты не обнаружены, пропускаем проверки webhook/HTTP")
-    check_environment()
+    check_environment(bots)
     print("\n" + SEPARATOR)
     print("Диагностика завершена. Проверьте вывод выше на наличие ❌/⚠️.")
     print("Если обнаружены ошибки:")
