@@ -132,6 +132,12 @@ def health_check():
     """Health check endpoint to verify app is running"""
     return "OK", 200
 
+# Import the global bot from main.py which has all handlers registered
+# This is critical: handlers are registered on this global bot instance,
+# so we must use IT for process_new_updates, while get_current_bot() 
+# returns the correct instance for sending messages (with correct token)
+from main import bot as main_bot
+
 # Webhook routing for each bot
 # Pattern: /webhook/{bot_name}
 def create_webhook_handler(bot_name, webhook_secret):
@@ -139,9 +145,10 @@ def create_webhook_handler(bot_name, webhook_secret):
     def telegram_webhook():
         import sys
         
-        # Set bot context for this request
+        # Set bot context for this request BEFORE processing
+        # This is critical: get_current_bot() in handlers will return
+        # the correct bot instance for this bot_name
         set_bot_context(bot_name)
-        bot = get_bot_instance(bot_name)
         
         try:
             # GET request - return status for testing
@@ -178,9 +185,11 @@ def create_webhook_handler(bot_name, webhook_secret):
                     data = update.callback_query.data or ""
                     print(f"[{datetime.now()}] [Webhook-{bot_name}] Processing callback_query from user {user_id}: {data[:50]}", file=sys.stderr)
                 
-                # Process update
+                # Process update using GLOBAL bot from main.py
+                # This bot has all handlers registered!
+                # The handlers use get_current_bot() to get the correct instance for sending
                 try:
-                    bot.process_new_updates([update])
+                    main_bot.process_new_updates([update])
                     print(f"[{datetime.now()}] [Webhook-{bot_name}] ✅ Update processed successfully", file=sys.stderr)
                 except Exception as e:
                     error_msg = str(e).lower()
