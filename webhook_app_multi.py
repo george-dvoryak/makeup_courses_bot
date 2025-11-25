@@ -212,8 +212,8 @@ for bot_name in bots.keys():
         
         return telegram_webhook
     
-    # Register route for this bot
-    app.route(webhook_path, methods=['POST', 'GET'])(create_webhook_handler(bot_name, webhook_secret))
+    # Register route for this bot with unique endpoint name
+    app.route(webhook_path, methods=['POST', 'GET'], endpoint=f'telegram_webhook_{bot_name}')(create_webhook_handler(bot_name, webhook_secret))
     print(f"[{datetime.now()}] Registered webhook route: {webhook_path} for bot: {bot_name}")
 
 # Set webhooks for all bots
@@ -261,7 +261,7 @@ for bot_name in bots.keys():
     def create_prodamus_handlers(bot_name):
         """Create Prodamus webhook handlers for a specific bot"""
         
-        @app.route(f"/prodamus/{bot_name}/result", methods=["GET", "POST"])
+        @app.route(f"/prodamus/{bot_name}/result", methods=["GET", "POST"], endpoint=f'prodamus_result_{bot_name}')
         def prodamus_result():
             """Handle Prodamus Result URL notification"""
             import sys
