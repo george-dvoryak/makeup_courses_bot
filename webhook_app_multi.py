@@ -134,6 +134,75 @@ def health_check():
 
 # Webhook routing for each bot
 # Pattern: /webhook/{bot_name}
+def create_webhook_handler(bot_name, webhook_secret):
+    """Create webhook handler for a specific bot"""
+    def telegram_webhook():
+        import sys
+        
+        # Set bot context for this request
+        set_bot_context(bot_name)
+        bot = get_bot_instance(bot_name)
+        
+        try:
+            # GET request - return status for testing
+            if request.method == 'GET':
+                return f"Webhook endpoint active for bot: {bot_name}. Path: {request.path}", 200
+            
+            # POST request - handle Telegram webhook
+            print(f"[{datetime.now()}] [Webhook-{bot_name}] Received POST request", file=sys.stderr)
+            
+            try:
+                # Validate Telegram secret header if configured
+                secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+                if webhook_secret:
+                    if secret != webhook_secret:
+                        print(f"[{datetime.now()}] [Webhook-{bot_name}] ❌ Invalid secret token", file=sys.stderr)
+                        abort(403)
+                    else:
+                        print(f"[{datetime.now()}] [Webhook-{bot_name}] ✅ Secret token validated", file=sys.stderr)
+                
+                # Get update data
+                json_str = request.get_data().decode('utf-8')
+                print(f"[{datetime.now()}] [Webhook-{bot_name}] Received data: {len(json_str)} bytes", file=sys.stderr)
+                
+                # Parse update
+                update = telebot.types.Update.de_json(json_str)
+                
+                # Log update type
+                if update.message:
+                    user_id = update.message.from_user.id
+                    text = update.message.text or ""
+                    print(f"[{datetime.now()}] [Webhook-{bot_name}] Processing message from user {user_id}: {text[:50]}", file=sys.stderr)
+                elif update.callback_query:
+                    user_id = update.callback_query.from_user.id
+                    data = update.callback_query.data or ""
+                    print(f"[{datetime.now()}] [Webhook-{bot_name}] Processing callback_query from user {user_id}: {data[:50]}", file=sys.stderr)
+                
+                # Process update
+                try:
+                    bot.process_new_updates([update])
+                    print(f"[{datetime.now()}] [Webhook-{bot_name}] ✅ Update processed successfully", file=sys.stderr)
+                except Exception as e:
+                    error_msg = str(e).lower()
+                    if "chat not found" in error_msg or "bot was blocked" in error_msg or "user is deactivated" in error_msg:
+                        print(f"[{datetime.now()}] [Webhook-{bot_name}] ⚠️ User blocked bot or chat not found", file=sys.stderr)
+                    else:
+                        print(f"[{datetime.now()}] [Webhook-{bot_name}] ❌ Error in bot.process_new_updates: {e}", file=sys.stderr)
+                        import traceback
+                        traceback.print_exc(file=sys.stderr)
+                
+            except Exception as e:
+                print(f"[{datetime.now()}] [Webhook-{bot_name}] ❌ Error processing update: {e}", file=sys.stderr)
+                import traceback
+                traceback.print_exc(file=sys.stderr)
+            
+            return "OK", 200
+        finally:
+            # Clear bot context after processing
+            clear_bot_context()
+    
+    return telegram_webhook
+
 for bot_name in bots.keys():
     config = get_bot_config(bot_name)
     webhook_path = config.get('WEBHOOK_PATH', f'/webhook/{bot_name}')
@@ -142,75 +211,6 @@ for bot_name in bots.keys():
     # Ensure path starts with /
     if not webhook_path.startswith('/'):
         webhook_path = '/' + webhook_path
-    
-    # Create webhook handler for this bot
-    def create_webhook_handler(bot_name, webhook_secret):
-        def telegram_webhook():
-            import sys
-            
-            # Set bot context for this request
-            set_bot_context(bot_name)
-            bot = get_bot_instance(bot_name)
-            
-            try:
-                # GET request - return status for testing
-                if request.method == 'GET':
-                    return f"Webhook endpoint active for bot: {bot_name}. Path: {request.path}", 200
-                
-                # POST request - handle Telegram webhook
-                print(f"[{datetime.now()}] [Webhook-{bot_name}] Received POST request", file=sys.stderr)
-                
-                try:
-                    # Validate Telegram secret header if configured
-                    secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
-                    if webhook_secret:
-                        if secret != webhook_secret:
-                            print(f"[{datetime.now()}] [Webhook-{bot_name}] ❌ Invalid secret token", file=sys.stderr)
-                            abort(403)
-                        else:
-                            print(f"[{datetime.now()}] [Webhook-{bot_name}] ✅ Secret token validated", file=sys.stderr)
-                    
-                    # Get update data
-                    json_str = request.get_data().decode('utf-8')
-                    print(f"[{datetime.now()}] [Webhook-{bot_name}] Received data: {len(json_str)} bytes", file=sys.stderr)
-                    
-                    # Parse update
-                    update = telebot.types.Update.de_json(json_str)
-                    
-                    # Log update type
-                    if update.message:
-                        user_id = update.message.from_user.id
-                        text = update.message.text or ""
-                        print(f"[{datetime.now()}] [Webhook-{bot_name}] Processing message from user {user_id}: {text[:50]}", file=sys.stderr)
-                    elif update.callback_query:
-                        user_id = update.callback_query.from_user.id
-                        data = update.callback_query.data or ""
-                        print(f"[{datetime.now()}] [Webhook-{bot_name}] Processing callback_query from user {user_id}: {data[:50]}", file=sys.stderr)
-                    
-                    # Process update
-                    try:
-                        bot.process_new_updates([update])
-                        print(f"[{datetime.now()}] [Webhook-{bot_name}] ✅ Update processed successfully", file=sys.stderr)
-                    except Exception as e:
-                        error_msg = str(e).lower()
-                        if "chat not found" in error_msg or "bot was blocked" in error_msg or "user is deactivated" in error_msg:
-                            print(f"[{datetime.now()}] [Webhook-{bot_name}] ⚠️ User blocked bot or chat not found", file=sys.stderr)
-                        else:
-                            print(f"[{datetime.now()}] [Webhook-{bot_name}] ❌ Error in bot.process_new_updates: {e}", file=sys.stderr)
-                            import traceback
-                            traceback.print_exc(file=sys.stderr)
-                    
-                except Exception as e:
-                    print(f"[{datetime.now()}] [Webhook-{bot_name}] ❌ Error processing update: {e}", file=sys.stderr)
-                    import traceback
-                    traceback.print_exc(file=sys.stderr)
-                
-                return "OK", 200
-            finally:
-                # Clear bot context after processing
-                clear_bot_context()
-        
-        return telegram_webhook
     
     # Register route for this bot with unique endpoint name
     app.route(webhook_path, methods=['POST', 'GET'], endpoint=f'telegram_webhook_{bot_name}')(create_webhook_handler(bot_name, webhook_secret))

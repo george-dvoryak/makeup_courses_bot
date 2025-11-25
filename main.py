@@ -160,6 +160,77 @@ def get_admin_broadcast_state():
         admin_broadcast_state[bot_name] = {}
     return admin_broadcast_state[bot_name]
 
+# HTML processing functions
+def strip_html(text: str) -> str:
+    """Remove all HTML tags from text"""
+    if not text:
+        return ""
+    return re.sub(r'<[^>]+>', '', text)
+
+def escape_html(text: str) -> str:
+    """Escape HTML special characters"""
+    if not text:
+        return ""
+    return (text.replace('&', '&amp;')
+                .replace('<', '&lt;')
+                .replace('>', '&gt;'))
+
+def format_text_for_telegram(text: str) -> str:
+    """
+    Convert Google Sheets formatting to Telegram HTML format.
+    Protects valid HTML tags and escapes others.
+    """
+    if not text:
+        return ""
+    
+    # Protect valid HTML tags (opening and closing)
+    # Pattern matches: <tag>, <tag attr="value">, </tag>
+    protected = []
+    tag_pattern = r'<(/?)([a-zA-Z][a-zA-Z0-9]*)(?:\s[^>]*)?>'
+    
+    def protect_tag(match):
+        tag_name = match.group(2).lower()
+        # List of valid Telegram HTML tags
+        valid_tags = {'b', 'strong', 'i', 'em', 'u', 's', 'strike', 'del', 'code', 'pre', 'a'}
+        if tag_name in valid_tags:
+            tag_id = f"__PROTECTED_TAG_{len(protected)}__"
+            protected.append(match.group(0))
+            return tag_id
+        return match.group(0)
+    
+    # Protect valid tags
+    text = re.sub(tag_pattern, protect_tag, text)
+    
+    # Escape all remaining HTML
+    text = escape_html(text)
+    
+    # Restore protected tags
+    for i, tag in enumerate(protected):
+        text = text.replace(f"__PROTECTED_TAG_{i}__", tag)
+    
+    return text
+
+# Payment helper functions
+def rub_to_kopecks(rub: float) -> int:
+    """Convert rubles to kopecks"""
+    return int(float(rub) * 100)
+
+def rub_str(rub: float) -> str:
+    """Format rubles as string with 2 decimal places"""
+    return f"{float(rub):.2f}"
+
+# Prodamus signature verification
+def verify_prodamus_signature(data: dict, secret_key: str, signature: str) -> bool:
+    """Verify Prodamus webhook signature"""
+    if not secret_key or not signature:
+        return False
+    try:
+        client = get_prodamus_client(secret_key)
+        return client.verify(data, signature)
+    except Exception as e:
+        print(f"[Prodamus] Signature verification error: {e}")
+        return False
+
 # --- Webhook / WSGI (PythonAnywhere) support ---
 # Import webhook config from config.py (already processed and normalized)
 try:
