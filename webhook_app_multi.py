@@ -249,7 +249,7 @@ for bot_name in bots.keys():
         print(f"[{datetime.now()}] Failed to set webhook for {bot_name}: {e}")
 
 # Prodamus webhook endpoints (with bot routing)
-# Pattern: /prodamus/{bot_name}/result, /prodamus/{bot_name}/success, /prodamus/{bot_name}/fail
+# Pattern: /prodamus/{bot_name}/result
 for bot_name in bots.keys():
     config = get_bot_config(bot_name)
     enable_prodamus = config.get('ENABLE_PRODAMUS', False)
@@ -265,52 +265,53 @@ for bot_name in bots.keys():
         def prodamus_result():
             """Handle Prodamus Result URL notification"""
             import sys
-            from main import verify_prodamus_signature, forward_to_test_webhook, get_courses_data, add_purchase, strip_html, add_user
+            from main import (
+                verify_prodamus_signature,
+                forward_to_test_webhook,
+                get_courses_data,
+                get_texts_data,
+                add_purchase,
+                strip_html,
+                add_user,
+                extract_prodamus_payload,
+            )
             from bot_context import set_bot_context, clear_bot_context
             from bot_factory import get_bot_instance
             import sqlite3
-            from telebot import types
-            import datetime as dt
-            
-            # Set bot context
+
             set_bot_context(bot_name)
             bot = get_bot_instance(bot_name)
             config = get_bot_config(bot_name)
-            
+
             try:
-                # Get request data
-                if request.method == "GET":
-                    data = request.args.to_dict()
-                else:
-                    data = request.form.to_dict() if request.form else request.get_json() or {}
-                
-                if request.method == "POST" and "sign" in request.headers:
-                    data["signature"] = request.headers.get("sign", "")
-                
-                print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] Received: {data}", file=sys.stderr)
-                
-                # Forward to test webhook
-                forward_to_test_webhook("result", data, request.method)
-                
-                # Verify signature
                 secret_key = config.get('PRODAMUS_SECRET_KEY', '')
+                signature = request.headers.get("Sign") or request.headers.get("sign") or ""
+                data = extract_prodamus_payload(request, secret_key)
+
+                if not data:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Empty payload", file=sys.stderr)
+                    return "ERROR: Empty payload", 400
+
+                print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 📨 Payload: {data}", file=sys.stderr)
+                forward_to_test_webhook("result", data, request.method)
+
                 if secret_key:
-                    if not verify_prodamus_signature(data, secret_key):
+                    if not verify_prodamus_signature(data, secret_key, signature):
                         print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Invalid signature", file=sys.stderr)
                         return "ERROR: Invalid signature", 400
-                
-                # Extract parameters
-                order_number = data.get("order_num", "") or data.get("order_id", "") or data.get("order", "")
-                amount = data.get("sum", "") or data.get("amount", "")
-                payment_status = (data.get("payment_status", "") or data.get("status", "")).lower()
-                
+
+                order_number = data.get("order_num") or data.get("order_id") or data.get("order")
+                amount = data.get("sum") or data.get("amount")
+                payment_status = (data.get("payment_status") or data.get("payment_status_description") or data.get("status") or "").lower()
+
                 if not order_number or not amount:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Missing parameters", file=sys.stderr)
                     return "ERROR: Missing parameters", 400
-                
+
                 if payment_status not in ("success", "paid", "successful"):
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Ignored status: {payment_status}", file=sys.stderr)
                     return "OK", 200
-                
-                # Find pending payment
+
                 db_path = config.get('DATABASE_PATH', f'{bot_name}.db')
                 try:
                     conn = sqlite3.connect(db_path)
@@ -328,38 +329,34 @@ for bot_name in bots.keys():
                     """)
                     cur.execute("SELECT user_id, course_id, amount FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
                     row = cur.fetchone()
-                    
+
                     if not row:
                         print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Pending payment not found: {order_number}", file=sys.stderr)
                         conn.close()
                         return "OK", 200
-                    
+
                     user_id, course_id, expected_amount = row
                     amount_float = float(amount)
-                    
+
                     if abs(amount_float - expected_amount) > 0.01:
                         print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Amount mismatch: expected {expected_amount}, got {amount_float}", file=sys.stderr)
                         conn.close()
                         return "OK", 200
-                    
-                    # Get course data
+
                     courses = get_courses_data(bot_name)
                     course = next((c for c in courses if str(c.get("id")) == str(course_id)), None)
-                    
+
                     if not course:
                         print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Course not found: {course_id}", file=sys.stderr)
                         conn.close()
                         return "ERROR: Course not found", 400
-                    
-                    # Add purchase
+
                     course_name = course.get("name", "Курс")
                     duration_days = course.get("duration_days")
                     channel_id = course.get("channel_id")
-                    
-                    # Add user if not exists
+
                     add_user(user_id, "")
-                    
-                    # Add purchase
+
                     payment_id = f"prodamus_{order_number}"
                     add_purchase(
                         user_id,
@@ -369,26 +366,26 @@ for bot_name in bots.keys():
                         duration_days,
                         payment_id=payment_id
                     )
-                    
-                    # Delete pending payment
+
                     cur.execute("DELETE FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
                     conn.commit()
                     conn.close()
-                    
+
                     print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ✅ Payment processed: user {user_id}, course {course_id}", file=sys.stderr)
-                    
-                    # Send success message
+
                     clean_course_name = strip_html(course_name)
                     texts = get_texts_data(bot_name)
-                    success_msg = texts.get("purchase_success_message", f"Оплата успешно выполнена! Вам предоставлен доступ к курсу {clean_course_name}.")
+                    success_msg = texts.get(
+                        "purchase_success_message",
+                        f"Оплата успешно выполнена! Вам предоставлен доступ к курсу {clean_course_name}."
+                    )
                     success_msg = success_msg.format(course_name=clean_course_name)
-                    
+
                     try:
                         bot.send_message(user_id, success_msg)
                     except Exception as e:
                         print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] Failed to send success message: {e}", file=sys.stderr)
-                    
-                    # Notify admins
+
                     admin_ids = config.get('ADMIN_IDS', [])
                     admin_text = f"💰 Оплата Prodamus: пользователь {user_id} купил {clean_course_name} на сумму {amount_float} руб. (Order: {order_number})"
                     for aid in admin_ids:
@@ -396,7 +393,7 @@ for bot_name in bots.keys():
                             bot.send_message(aid, admin_text)
                         except Exception:
                             pass
-                    
+
                     return "OK", 200
                 except Exception as e:
                     print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Error: {e}", file=sys.stderr)
@@ -405,102 +402,8 @@ for bot_name in bots.keys():
                     return "ERROR", 500
             finally:
                 clear_bot_context()
-        
-        @app.route(f"/prodamus/{bot_name}/success", methods=["GET", "POST"])
-        def prodamus_success():
-            """Handle Prodamus Success URL (fallback payment processing)"""
-            import sys
-            from main import forward_to_test_webhook, verify_prodamus_signature, get_courses_data, add_purchase, strip_html, add_user
-            from bot_context import set_bot_context, clear_bot_context
-            from bot_factory import get_bot_instance
-            import sqlite3
-            
-            set_bot_context(bot_name)
-            bot = get_bot_instance(bot_name)
-            config = get_bot_config(bot_name)
-            
-            try:
-                if request.method == "GET":
-                    data = request.args.to_dict()
-                else:
-                    data = request.form.to_dict() if request.form else request.get_json() or {}
-                
-                print(f"[{datetime.now()}] [Prodamus-{bot_name} Success] User redirected: {data}", file=sys.stderr)
-                
-                forward_to_test_webhook("success", data, request.method)
-                
-                # Extract payment info
-                payform_status = data.get("_payform_status", "").lower()
-                payform_order_id = data.get("_payform_order_id", "")
-                payform_sign = data.get("_payform_sign", "")
-                
-                if payform_status == "success" and payform_order_id:
-                    # Process payment (similar to result handler)
-                    db_path = config.get('DATABASE_PATH', f'{bot_name}.db')
-                    try:
-                        conn = sqlite3.connect(db_path)
-                        cur = conn.cursor()
-                        cur.execute("SELECT user_id, course_id, amount FROM pending_payments WHERE order_id = ?", (payform_order_id,))
-                        row = cur.fetchone()
-                        
-                        if row:
-                            user_id, course_id, expected_amount = row
-                            # Check if already processed
-                            from db import has_active_subscription
-                            if not has_active_subscription(user_id, course_id):
-                                # Process payment
-                                courses = get_courses_data(bot_name)
-                                course = next((c for c in courses if str(c.get("id")) == str(course_id)), None)
-                                if course:
-                                    add_user(user_id, "")
-                                    course_name = course.get("name", "Курс")
-                                    duration_days = course.get("duration_days")
-                                    channel_id = course.get("channel_id")
-                                    payment_id = f"prodamus_{payform_order_id}"
-                                    add_purchase(
-                                        user_id,
-                                        course_id,
-                                        course_name,
-                                        channel_id,
-                                        duration_days,
-                                        payment_id=payment_id
-                                    )
-                                    cur.execute("DELETE FROM pending_payments WHERE order_id = ?", (payform_order_id,))
-                                    conn.commit()
-                                    
-                                    texts = get_texts_data(bot_name)
-                                    success_msg = texts.get("purchase_success_message", "Оплата успешно выполнена!")
-                                    try:
-                                        bot.send_message(user_id, success_msg)
-                                    except Exception:
-                                        pass
-                        conn.close()
-                    except Exception as e:
-                        print(f"[{datetime.now()}] [Prodamus-{bot_name} Success] Error: {e}", file=sys.stderr)
-                
-                return "OK", 200
-            finally:
-                clear_bot_context()
-        
-        @app.route(f"/prodamus/{bot_name}/fail", methods=["GET", "POST"])
-        def prodamus_fail():
-            """Handle Prodamus Fail URL"""
-            import sys
-            from main import forward_to_test_webhook
-            
-            if request.method == "GET":
-                data = request.args.to_dict()
-            else:
-                data = request.form.to_dict() if request.form else request.get_json() or {}
-            
-            print(f"[{datetime.now()}] [Prodamus-{bot_name} Fail] User redirected: {data}", file=sys.stderr)
-            forward_to_test_webhook("fail", data, request.method)
-            
-            return "Payment failed", 200
-    
-    # Register handlers
+
     create_prodamus_handlers(bot_name)
-    print(f"[{datetime.now()}] Registered Prodamus webhooks for bot: {bot_name}")
 
 # For now, export app for WSGI
 # In production, rename this file to webhook_app.py or update WSGI file

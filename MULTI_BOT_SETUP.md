@@ -119,10 +119,10 @@ BOTS_LIST=bot1,bot2,newbot
 В личном кабинете Prodamus укажите webhook URL'ы:
 
 ```
-Result URL:  https://yourusername.pythonanywhere.com/prodamus/newbot/result
-Success URL: https://yourusername.pythonanywhere.com/prodamus/newbot/success
-Fail URL:    https://yourusername.pythonanywhere.com/prodamus/newbot/fail
+Result URL: https://yourusername.pythonanywhere.com/prodamus/newbot/result
 ```
+
+> ⚠️ Success/Fail URLs теперь не используются логикой бота. Их можно оставить пустыми или настроить на произвольную страницу с сообщением для пользователя. Все события оплаты обрабатываются только через Result URL.
 
 ### Шаг 7: Перезапустите приложение
 
