@@ -1,291 +1,360 @@
 #!/usr/bin/env python3
 """
-Полная диагностика всех компонентов на PythonAnywhere
+Полная диагностика мульти-ботовой установки на PythonAnywhere.
+Скрипт проверяет:
+  • Пути и виртуальное окружение
+  • Наличие ключевых файлов
+  • Установку зависимостей
+  • Конфигурацию всех ботов
+  • Подключение баз данных
+  • Flask-приложение webhook_app_multi
+  • WSGI конфигурацию
+  • Webhook статусы Telegram для каждого бота
+  • Доступность HTTP endpoint'ов
 """
-import sys
 import os
-
-print("=" * 70)
-print("ПОЛНАЯ ДИАГНОСТИКА PYTHONANYWHERE")
-print("=" * 70)
-
-# 1. Проверка путей
-print("\n1. ПРОВЕРКА PYTHON PATH")
-print("-" * 70)
-project_path = '/home/goshadvoryak/makeup_courses_bot'
-venv_path = '/home/goshadvoryak/makeup_courses_bot/venv/lib/python3.10/site-packages'
-user_site = None
-
-try:
-    import site
-    user_site = site.getusersitepackages()
-except:
-    pass
-
-print(f"Project path: {project_path}")
-print(f"Venv path: {venv_path}")
-print(f"User site-packages: {user_site}")
-
-# Добавляем пути
-if project_path not in sys.path:
-    sys.path.insert(0, project_path)
-if os.path.exists(venv_path) and venv_path not in sys.path:
-    sys.path.insert(0, venv_path)
-if user_site and user_site not in sys.path:
-    sys.path.insert(0, user_site)
-
-print(f"\nТекущий sys.path (первые 5):")
-for p in sys.path[:5]:
-    exists = "✅" if os.path.exists(p) else "❌"
-    print(f"  {exists} {p}")
-
-# 2. Проверка файлов проекта
-print("\n2. ПРОВЕРКА ФАЙЛОВ ПРОЕКТА")
-print("-" * 70)
-required_files = [
-    'main.py',
-    'webhook_app.py',
-    'config.py',
-    'db.py',
-    'google_sheets.py',
-    '.env',
-    'requirements.txt'
-]
-
-for file in required_files:
-    filepath = os.path.join(project_path, file)
-    exists = os.path.exists(filepath)
-    status = "✅" if exists else "❌"
-    size = os.path.getsize(filepath) if exists else 0
-    print(f"  {status} {file} ({size} bytes)")
-
-# 3. Проверка импортов
-print("\n3. ПРОВЕРКА ИМПОРТОВ")
-print("-" * 70)
-
-try:
-    import telebot
-    print(f"✅ telebot: {telebot.__file__}")
-except Exception as e:
-    print(f"❌ telebot: {e}")
-
-try:
-    import flask
-    print(f"✅ flask: {flask.__file__}")
-except Exception as e:
-    print(f"❌ flask: {e}")
+import sys
+import json
+import traceback
+from pathlib import Path
 
 try:
     import requests
-    print(f"✅ requests: {requests.__file__}")
-except Exception as e:
-    print(f"❌ requests: {e}")
+except ImportError:
+    requests = None
 
-try:
-    from config import (
-        TELEGRAM_BOT_TOKEN, WEBHOOK_URL, WEBHOOK_PATH, 
-        WEBHOOK_SECRET_TOKEN, DATABASE_PATH
-    )
-    print(f"✅ config импортирован")
-    print(f"   TELEGRAM_BOT_TOKEN: {TELEGRAM_BOT_TOKEN[:10]}...")
-    print(f"   WEBHOOK_URL: {WEBHOOK_URL}")
-    print(f"   WEBHOOK_PATH: {WEBHOOK_PATH}")
-    print(f"   DATABASE_PATH: {DATABASE_PATH}")
-except Exception as e:
-    print(f"❌ config: {e}")
-    import traceback
-    traceback.print_exc()
+SEPARATOR = "=" * 80
+project_path = Path(__file__).resolve().parent
+default_project_root = project_path
+default_venv = (project_path / "venv")
+python_version = f"python{sys.version_info.major}.{sys.version_info.minor}"
 
-# 4. Проверка базы данных
-print("\n4. ПРОВЕРКА БАЗЫ ДАННЫХ")
-print("-" * 70)
-try:
-    db_path = DATABASE_PATH if 'DATABASE_PATH' in locals() else None
-    if db_path:
-        exists = os.path.exists(db_path)
-        if exists:
-            size = os.path.getsize(db_path)
-            print(f"✅ База данных существует: {db_path} ({size} bytes)")
-        else:
-            print(f"⚠️ База данных не существует: {db_path}")
-    else:
-        print("⚠️ DATABASE_PATH не определён")
-except Exception as e:
-    print(f"❌ Ошибка проверки БД: {e}")
 
-# 5. Проверка импорта main
-print("\n5. ПРОВЕРКА ИМПОРТА MAIN")
-print("-" * 70)
-try:
-    from main import bot
-    print("✅ main импортирован")
-    print(f"   Bot token: {TELEGRAM_BOT_TOKEN[:10]}...")
-except Exception as e:
-    print(f"❌ Ошибка импорта main: {e}")
-    import traceback
-    traceback.print_exc()
+def mask(value: str, visible: int = 6) -> str:
+    if not value:
+        return "<empty>"
+    if len(value) <= visible:
+        return value
+    return value[:visible] + "..."
 
-# 6. Проверка импорта webhook_app
-print("\n6. ПРОВЕРКА ИМПОРТА WEBHOOK_APP")
-print("-" * 70)
-try:
-    from webhook_app import app
-    print("✅ webhook_app импортирован")
-    print(f"   App type: {type(app)}")
-    print(f"   App name: {app.name}")
-except Exception as e:
-    print(f"❌ Ошибка импорта webhook_app: {e}")
-    import traceback
-    traceback.print_exc()
 
-# 7. Проверка маршрутов Flask
-print("\n7. ПРОВЕРКА МАРШРУТОВ FLASK")
-print("-" * 70)
-try:
-    routes = []
-    for rule in app.url_map.iter_rules():
-        routes.append(f"{rule.rule} [{', '.join(sorted(rule.methods))}]")
-    
-    if routes:
-        print(f"✅ Найдено {len(routes)} маршрутов:")
-        for route in routes:
-            print(f"   {route}")
-    else:
-        print("❌ Маршруты не найдены!")
-except Exception as e:
-    print(f"❌ Ошибка проверки маршрутов: {e}")
+def print_header(title: str):
+    print(f"\n{title}")
+    print("-" * len(title))
 
-# 8. Проверка WSGI файла
-print("\n8. ПРОВЕРКА WSGI ФАЙЛА")
-print("-" * 70)
-wsgi_path = '/var/www/goshadvoryak_pythonanywhere_com_wsgi.py'
-if os.path.exists(wsgi_path):
+
+def add_sys_paths():
+    added = []
+    user_site = None
+    try:
+        import site
+
+        user_site = site.getusersitepackages()
+    except Exception:
+        pass
+
+    venv_path = Path(os.environ.get("VIRTUAL_ENV", default_venv))
+    site_packages = venv_path / "lib" / python_version / "site-packages"
+
+    for path in [str(project_path), str(site_packages), user_site]:
+        if path and path not in sys.path:
+            sys.path.insert(0, path)
+            added.append(path)
+
+    print_header("1. PYTHON PATH / ВИРТУАЛЬНОЕ ОКРУЖЕНИЕ")
+    print(f"Project root: {project_path}")
+    print(f"Virtualenv : {venv_path}")
+    print(f"Site-packages added: {site_packages}")
+    if user_site:
+        print(f"User site-packages: {user_site}")
+    print("\nПути добавлены в sys.path:")
+    for path in added:
+        exists = "✅" if os.path.exists(path) else "❌"
+        print(f"  {exists} {path}")
+    print("\nПервые 5 записей sys.path:")
+    for p in sys.path[:5]:
+        exists = "✅" if os.path.exists(p) else "❌"
+        print(f"  {exists} {p}")
+
+
+def check_files():
+    print_header("2. ПРОВЕРКА КЛЮЧЕВЫХ ФАЙЛОВ")
+    required_files = [
+        "main.py",
+        "webhook_app_multi.py",
+        "bot_factory.py",
+        "bot_context.py",
+        "config.py",
+        "db.py",
+        "google_sheets.py",
+        ".env",
+        "requirements.txt",
+        "MULTI_BOT_SETUP.md",
+    ]
+    for rel_path in required_files:
+        path = project_path / rel_path
+        exists = path.exists()
+        size = path.stat().st_size if exists else 0
+        status = "✅" if exists else "❌"
+        print(f"  {status} {rel_path} ({size} bytes)")
+
+
+def check_dependencies():
+    print_header("3. ПРОВЕРКА ЗАВИСИМОСТЕЙ")
+    to_check = ["telebot", "flask", "requests", "prodamuspy", "dotenv"]
+    for module in to_check:
+        try:
+            mod = __import__(module)
+            location = getattr(mod, "__file__", "built-in")
+            print(f"✅ {module}: {location}")
+        except Exception as e:
+            print(f"❌ {module}: {e}")
+
+
+def summarize_config():
+    print_header("4. КОНФИГУРАЦИЯ БОТОВ")
+    try:
+        from config import (
+            CURRENT_BOT_NAME,
+            get_available_bots,
+            get_bot_config,
+        )
+
+        bots = get_available_bots()
+        if not bots:
+            bots = [CURRENT_BOT_NAME]
+
+        print(f"Найдено ботов: {len(bots)} (current default: {CURRENT_BOT_NAME})")
+        env_bots_list = os.environ.get("BOTS_LIST")
+        if env_bots_list:
+            print(f"BOTS_LIST (env): {env_bots_list}")
+
+        for bot_name in bots:
+            cfg = get_bot_config(bot_name)
+            print(f"\n--- Бот: {bot_name} ---")
+            print(f"  Token             : {mask(cfg.get('TELEGRAM_BOT_TOKEN'))}")
+            print(f"  Admin IDs         : {cfg.get('ADMIN_IDS', [])}")
+            print(f"  DB Path           : {cfg.get('DATABASE_PATH')}")
+            print(f"  Sheets ID         : {cfg.get('GSHEET_ID')}")
+            print(f"  Courses sheet     : {cfg.get('GSHEET_COURSES_NAME')}")
+            print(f"  Texts sheet       : {cfg.get('GSHEET_TEXTS_NAME')}")
+            print(f"  YooKassa token    : {mask(cfg.get('PAYMENT_PROVIDER_TOKEN'))}")
+            print(f"  Currency          : {cfg.get('CURRENCY')}")
+            print(f"  Prodamus enabled  : {cfg.get('ENABLE_PRODAMUS')}")
+            if cfg.get("ENABLE_PRODAMUS"):
+                print(f"    Payform URL     : {cfg.get('PRODAMUS_PAYFORM_URL')}")
+                print(f"    Secret key      : {mask(cfg.get('PRODAMUS_SECRET_KEY'))}")
+                print(f"    System ID       : {cfg.get('PRODAMUS_SYSTEM_ID') or '<not set>'}")
+            webhook_host = cfg.get("WEBHOOK_HOST")
+            webhook_path = cfg.get("WEBHOOK_PATH") or f"/webhook/{bot_name}"
+            webhook_url = cfg.get("WEBHOOK_URL") or (f"https://{webhook_host}{webhook_path}" if webhook_host else "")
+            print(f"  Webhook host      : {webhook_host}")
+            print(f"  Webhook path      : {webhook_path}")
+            print(f"  Webhook URL       : {webhook_url or '<not set>'}")
+            print(f"  Webhook secret    : {mask(cfg.get('WEBHOOK_SECRET_TOKEN')) if cfg.get('WEBHOOK_SECRET_TOKEN') else '<empty>'}")
+
+        return bots
+    except Exception as e:
+        print(f"❌ Не удалось прочитать конфигурацию: {e}")
+        traceback.print_exc()
+        return []
+
+
+def check_databases(bots):
+    print_header("5. ПРОВЕРКА БАЗ ДАННЫХ")
+    if not bots:
+        print("⚠️ Боты не обнаружены, пропускаем проверку БД")
+        return
+    from config import get_bot_config
+
+    for bot_name in bots:
+        cfg = get_bot_config(bot_name)
+        db_path = Path(cfg.get("DATABASE_PATH", f"{bot_name}.db"))
+        exists = db_path.exists()
+        size = db_path.stat().st_size if exists else 0
+        status = "✅" if exists else "⚠️"
+        print(f"{status} {bot_name}: {db_path} ({size} bytes)")
+
+
+def check_main_import():
+    print_header("6. ПРОВЕРКА ИМПОРТА main.py")
+    try:
+        import main  # noqa
+
+        print("✅ main.py импортирован успешно")
+    except Exception as e:
+        print(f"❌ Ошибка импорта main: {e}")
+        traceback.print_exc()
+
+
+def check_webhook_app():
+    print_header("7. ПРОВЕРКА webhook_app_multi.py")
+    try:
+        from webhook_app_multi import app
+
+        print(f"✅ webhook_app_multi импортирован (Flask app: {app.name})")
+        print("\nМаршруты Flask:")
+        for rule in sorted(app.url_map.iter_rules(), key=lambda r: r.rule):
+            methods = ", ".join(sorted(rule.methods))
+            print(f"  • {rule.rule} [{methods}] (endpoint: {rule.endpoint})")
+    except Exception as e:
+        print(f"❌ Ошибка импорта webhook_app_multi: {e}")
+        traceback.print_exc()
+
+
+def check_wsgi():
+    print_header("8. ПРОВЕРКА WSGI ФАЙЛА")
+    domain = os.environ.get("PYTHONANYWHERE_DOMAIN", "manybot-goshadvoryak.pythonanywhere.com")
+    wsgi_name = domain.replace(".", "_").replace("-", "_")
+    wsgi_path = Path(f"/var/www/{wsgi_name}_wsgi.py")
+    if not wsgi_path.exists():
+        print(f"❌ WSGI файл не найден: {wsgi_path}")
+        return
     print(f"✅ WSGI файл существует: {wsgi_path}")
     try:
-        with open(wsgi_path, 'r') as f:
-            wsgi_content = f.read()
-        print(f"   Размер: {len(wsgi_content)} байт")
-        
-        # Проверяем содержимое
-        checks = [
-            ('sys.path.insert', 'Добавление путей'),
-            ('webhook_app', 'Импорт webhook_app'),
-            ('application', 'Переменная application'),
-        ]
-        
-        for check, desc in checks:
-            if check in wsgi_content:
-                print(f"   ✅ {desc}")
-            else:
-                print(f"   ❌ {desc} - НЕ НАЙДЕНО!")
-        
-        # Показываем содержимое
-        print("\n   Содержимое WSGI файла:")
-        print("   " + "=" * 60)
-        lines = wsgi_content.split('\n')
-        for i, line in enumerate(lines[:30], 1):
-            print(f"   {i:3d}: {line}")
-        if len(lines) > 30:
-            remaining = len(lines) - 30
-            print(f"   ... (ещё {remaining} строк)")
-        print("   " + "=" * 60)
-        
+        content = wsgi_path.read_text()
+        print(f"   Размер: {len(content)} байт")
+        required_snippets = {
+            "webhook_app_multi": "Импорт webhook_app_multi",
+            "application": "Переменная application",
+            "sys.path.insert": "Добавление project_path",
+        }
+        for snippet, desc in required_snippets.items():
+            status = "✅" if snippet in content else "❌"
+            print(f"   {status} {desc}")
     except Exception as e:
         print(f"❌ Ошибка чтения WSGI файла: {e}")
-else:
-    print(f"❌ WSGI файл НЕ существует: {wsgi_path}")
-    print("   Создайте файл через Web → WSGI configuration file")
 
-# 9. Проверка webhook в Telegram
-print("\n9. ПРОВЕРКА WEBHOOK В TELEGRAM")
-print("-" * 70)
-try:
-    import requests
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getWebhookInfo"
-    response = requests.get(url, timeout=10)
-    data = response.json()
-    
-    if data.get("ok"):
-        webhook_info = data.get("result", {})
-        current_url = webhook_info.get("url", "")
-        pending = webhook_info.get("pending_update_count", 0)
-        last_error = webhook_info.get("last_error_message")
-        
-        print(f"   Webhook URL: {current_url if current_url else 'НЕ УСТАНОВЛЕН'}")
-        print(f"   Pending updates: {pending}")
-        
-        if current_url == WEBHOOK_URL:
-            print("   ✅ Webhook URL совпадает с конфигурацией")
-        elif current_url:
-            print(f"   ⚠️ Webhook URL не совпадает!")
-            print(f"      Текущий: {current_url}")
-            print(f"      Ожидается: {WEBHOOK_URL}")
+
+def check_webhooks(bots):
+    print_header("9. ПРОВЕРКА TELEGRAM WEBHOOK ДЛЯ КАЖДОГО БОТА")
+    if not requests:
+        print("❌ Модуль requests недоступен, пропускаем проверку")
+        return
+    from config import get_bot_config
+
+    for bot_name in bots:
+        cfg = get_bot_config(bot_name)
+        token = cfg.get("TELEGRAM_BOT_TOKEN")
+        webhook_url_expected = cfg.get("WEBHOOK_URL") or (f"https://{cfg.get('WEBHOOK_HOST')}{cfg.get('WEBHOOK_PATH')}" if cfg.get("WEBHOOK_HOST") else "")
+        print(f"\nБот {bot_name}:")
+        if not token:
+            print("  ❌ Token не задан")
+            continue
+        try:
+            resp = requests.get(f"https://api.telegram.org/bot{token}/getWebhookInfo", timeout=10)
+            data = resp.json()
+            if not data.get("ok"):
+                print(f"  ❌ Telegram API error: {data.get('description')}")
+                continue
+            info = data.get("result", {})
+            current_url = info.get("url") or "<не установлен>"
+            pending = info.get("pending_update_count", 0)
+            last_error = info.get("last_error_message")
+            print(f"  Текущий webhook URL: {current_url}")
+            if webhook_url_expected:
+                if current_url == webhook_url_expected:
+                    print("  ✅ Совпадает с ожидаемым URL")
+                else:
+                    print(f"  ⚠️ Ожидается: {webhook_url_expected}")
+            print(f"  Pending updates: {pending}")
+            if last_error:
+                print(f"  ❌ Последняя ошибка: {last_error}")
+            else:
+                print("  ✅ Telegram ошибок не сообщает")
+        except Exception as e:
+            print(f"  ❌ Ошибка запроса getWebhookInfo: {e}")
+
+
+def test_http_endpoints(bots):
+    print_header("10. ТЕСТ HTTP ENDPOINT-ОВ")
+    if not requests:
+        print("❌ Модуль requests недоступен, пропускаем тест")
+        return
+    from config import get_bot_config
+
+    checked_hosts = set()
+    for bot_name in bots:
+        cfg = get_bot_config(bot_name)
+        webhook_host = cfg.get("WEBHOOK_HOST")
+        webhook_path = cfg.get("WEBHOOK_PATH") or f"/webhook/{bot_name}"
+        if not webhook_host:
+            print(f"\nБот {bot_name}: ⚠️ WEBHOOK_HOST не задан, пропускаем HTTP тесты")
+            continue
+        base_url = f"https://{webhook_host}"
+        if base_url not in checked_hosts:
+            print(f"\nОбщий health-check: {base_url}")
+            try:
+                resp = requests.get(base_url, timeout=10)
+                print(f"  Статус: {resp.status_code}")
+                if resp.status_code == 200:
+                    print(f"  ✅ Health endpoint OK (ответ: {resp.text[:80]})")
+                else:
+                    print(f"  ⚠️ Ответ: {resp.text[:80]}")
+            except Exception as e:
+                print(f"  ❌ Health-check не доступен: {e}")
+            checked_hosts.add(base_url)
+
+        webhook_url = cfg.get("WEBHOOK_URL") or f"{base_url}{webhook_path}"
+        print(f"\nБот {bot_name}: проверяем {webhook_url}")
+        try:
+            resp = requests.get(webhook_url, timeout=10)
+            print(f"  Статус: {resp.status_code}")
+            preview = resp.text[:120].replace("\n", " ")
+            print(f"  Ответ: {preview}")
+            if resp.status_code == 200:
+                print("  ✅ Webhook GET доступен")
+            else:
+                print("  ⚠️ Webhook GET ответил не 200")
+        except Exception as e:
+            print(f"  ❌ Ошибка обращения к webhook: {e}")
+
+
+def check_environment():
+    print_header("11. ПРОВЕРКА КЛЮЧЕВЫХ ENV ПЕРЕМЕННЫХ")
+    keys = [
+        "BOTS_LIST",
+        "USE_WEBHOOK",
+        "WEBHOOK_HOST",
+        "WEBHOOK_PATH",
+        "WEBHOOK_SECRET_TOKEN",
+    ]
+    for key in keys:
+        value = os.environ.get(key)
+        if not value:
+            print(f"  ⚠️ {key}: не установлена")
+        elif "TOKEN" in key or "SECRET" in key:
+            print(f"  ✅ {key}: {mask(value)}")
         else:
-            print("   ❌ Webhook НЕ установлен!")
-        
-        if pending > 0:
-            print(f"   ⚠️ Есть {pending} необработанных обновлений")
-        
-        if last_error:
-            print(f"   ❌ Последняя ошибка: {last_error}")
-        else:
-            print("   ✅ Ошибок нет")
+            print(f"  ✅ {key}: {value}")
+
+
+def main():
+    print(SEPARATOR)
+    print("ПОЛНЫЙ ДИАГНОСТИЧЕСКИЙ ОТЧЕТ (мульти-бот)")
+    print(SEPARATOR)
+    add_sys_paths()
+    check_files()
+    check_dependencies()
+    bots = summarize_config()
+    check_databases(bots)
+    check_main_import()
+    check_webhook_app()
+    check_wsgi()
+    if bots:
+        check_webhooks(bots)
+        test_http_endpoints(bots)
     else:
-        print(f"❌ Ошибка получения статуса: {data.get('description')}")
-except Exception as e:
-    print(f"❌ Ошибка проверки webhook: {e}")
+        print("\n⚠️ Боты не обнаружены, пропускаем проверки webhook/HTTP")
+    check_environment()
+    print("\n" + SEPARATOR)
+    print("Диагностика завершена. Проверьте вывод выше на наличие ❌/⚠️.")
+    print("Если обнаружены ошибки:")
+    print("  1) Убедитесь, что виртуальное окружение активировано в Web settings")
+    print("  2) Перезапустите веб-приложение после исправлений")
+    print("  3) Перепроверьте токены и webhook URLs в конфигурации")
 
-# 10. Тест endpoint
-print("\n10. ТЕСТ ENDPOINT")
-print("-" * 70)
-try:
-    import requests
-    base_url = WEBHOOK_URL.replace(WEBHOOK_PATH, "")
-    
-    # Health check
-    try:
-        response = requests.get(base_url, timeout=10)
-        if response.status_code == 200:
-            print(f"✅ Health check работает: {base_url}")
-        else:
-            print(f"⚠️ Health check вернул {response.status_code}")
-    except Exception as e:
-        print(f"❌ Health check не работает: {e}")
-    
-    # Webhook GET
-    try:
-        response = requests.get(WEBHOOK_URL, timeout=10)
-        if response.status_code == 200:
-            print(f"✅ Webhook GET работает: {WEBHOOK_URL}")
-            print(f"   Response: {response.text[:100]}")
-        else:
-            print(f"⚠️ Webhook GET вернул {response.status_code}")
-    except Exception as e:
-        print(f"❌ Webhook GET не работает: {e}")
-        
-except Exception as e:
-    print(f"❌ Ошибка теста endpoint: {e}")
 
-# 11. Проверка переменных окружения
-print("\n11. ПРОВЕРКА ПЕРЕМЕННЫХ ОКРУЖЕНИЯ")
-print("-" * 70)
-env_vars = ['TELEGRAM_BOT_TOKEN', 'USE_WEBHOOK', 'WEBHOOK_URL', 'WEBHOOK_PATH']
-for var in env_vars:
-    value = os.environ.get(var)
-    if value:
-        if 'TOKEN' in var:
-            print(f"   ✅ {var}: {value[:10]}...")
-        else:
-            print(f"   ✅ {var}: {value}")
-    else:
-        print(f"   ⚠️ {var}: не установлена")
-
-print("\n" + "=" * 70)
-print("ДИАГНОСТИКА ЗАВЕРШЕНА")
-print("=" * 70)
-print("\nВАЖНО:")
-print("1. Проверьте WSGI файл - он должен импортировать webhook_app")
-print("2. Проверьте, что webhook установлен в Telegram")
-print("3. Перезагрузите веб-приложение после изменений")
-print("4. Проверьте Error log после отправки сообщения боту")
+if __name__ == "__main__":
+    main()
 
