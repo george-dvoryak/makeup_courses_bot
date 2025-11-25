@@ -38,7 +38,10 @@ def get_current_bot():
 # Helper function to get current bot config
 def get_current_config():
     """Get current bot configuration based on context"""
-    bot_name = get_bot_context() or CURRENT_BOT_NAME
+    context_bot = get_bot_context()
+    bot_name = context_bot or CURRENT_BOT_NAME
+    # Debug logging
+    print(f"[Config] get_current_config called: context={context_bot}, using={bot_name}")
     return get_bot_config(bot_name)
 
 # Helper function to get current admin IDs
@@ -121,21 +124,59 @@ def extract_prodamus_payload(req, secret_key: str) -> dict:
 
 def resolve_prodamus_payment_link(long_url: str) -> str:
     """
-    Resolve the final (short) Prodamus URL by following the redirect once.
+    Resolve the final (short) Prodamus URL by following redirects.
+    
+    Prodamus generates short links like: https://domain.payform.ru/p/p5z2micwqc9c26/
+    We need to follow the redirect from the long URL to get this short link.
+    
     Falls back to the original URL if resolution fails.
     """
     if not long_url:
         return long_url
+    
     try:
+        # First, try with allow_redirects=False to capture the redirect location
+        response = requests.get(long_url, allow_redirects=False, timeout=15)
+        
+        # Check for redirect (3xx status codes)
+        if response.status_code in (301, 302, 303, 307, 308):
+            location = response.headers.get("Location")
+            if location:
+                print(f"[Prodamus] Resolved short link: {location}")
+                return location
+        
+        # If no redirect, try following redirects and get final URL
         response = requests.get(long_url, allow_redirects=True, timeout=15)
-        if response.url and response.url != long_url:
-            return response.url
-        location = response.headers.get("Location")
-        if location:
-            return location
+        final_url = response.url
+        
+        # Check if we got a short link format (contains /p/ path)
+        if final_url and final_url != long_url:
+            print(f"[Prodamus] Resolved via redirect chain: {final_url}")
+            return final_url
+        
+        # Check response for redirect in HTML meta or JavaScript
+        # Some systems use client-side redirects
+        if response.status_code == 200:
+            content = response.text[:2000]  # Check first 2000 chars
+            # Look for meta refresh or window.location patterns
+            import re
+            meta_match = re.search(r'<meta[^>]*http-equiv=["\']refresh["\'][^>]*url=([^"\'>\s]+)', content, re.IGNORECASE)
+            if meta_match:
+                redirect_url = meta_match.group(1)
+                print(f"[Prodamus] Found meta refresh redirect: {redirect_url}")
+                return redirect_url
+        
+        print(f"[Prodamus] No redirect found, using original URL")
+        return long_url
+        
+    except requests.exceptions.Timeout:
+        print(f"[Prodamus] Timeout while resolving short link, using original URL")
+        return long_url
     except Exception as e:
         print(f"[Prodamus] Failed to resolve short link: {e}")
-    return long_url
+        import traceback
+        traceback.print_exc()
+        return long_url
 
 # In-memory state for Prodamus email collection (per bot)
 # Format: {bot_name: {user_id: {"course_id": course_id, "order_id": order_id, "price": price, "name": name}}}
@@ -234,6 +275,8 @@ def verify_prodamus_signature(data: dict, secret_key: str, signature: str) -> bo
 def generate_prodamus_payment_url(order_number: str, amount: float, product_name: str, customer_email: str = "", customer_phone: str = "", extra_params: dict = None) -> str:
     """
     Build payment URL for Prodamus payform.
+    
+    Format: https://domain.payform.ru/?order_id=X&products[0][price]=Y&products[0][quantity]=1&products[0][name]=Z&do=pay
     """
     config = get_current_payment_config()
     base_url = config.get('PRODAMUS_PAYFORM_URL') or PRODAMUS_PAYFORM_URL
@@ -241,22 +284,42 @@ def generate_prodamus_payment_url(order_number: str, amount: float, product_name
         raise RuntimeError("PRODAMUS_PAYFORM_URL is not configured")
     if not base_url.startswith("http"):
         base_url = f"https://{base_url}"
-    params = {
-        "old_auth": 1,
-        "order": order_number,
-        "sum": rub_str(amount),
-        "description": strip_html(product_name) if product_name else "Курс",
-    }
+    
+    # Clean product name
+    clean_name = strip_html(product_name) if product_name else "Доступ к курсу"
+    
+    # Build parameters according to Prodamus documentation
+    # Using products[] array format
+    params = [
+        ("order_id", order_number),
+        ("products[0][price]", rub_str(amount)),
+        ("products[0][quantity]", "1"),
+        ("products[0][name]", clean_name),
+        ("customer_extra", f"Оплата курса: {clean_name}"),
+        ("do", "pay"),  # Auto-start payment
+    ]
+    
+    # Add customer info
+    if customer_email:
+        params.append(("customer_email", customer_email))
+    if customer_phone:
+        # Normalize phone number
+        phone = customer_phone.replace("+", "").replace(" ", "").replace("-", "")
+        params.append(("customer_phone", phone))
+    
+    # Add system_id if configured
     system_id = config.get("PRODAMUS_SYSTEM_ID")
     if system_id:
-        params["system_id"] = system_id
-    if customer_email:
-        params["customer_email"] = customer_email
-    if customer_phone:
-        params["customer_phone"] = customer_phone
+        params.append(("sys", system_id))
+    
+    # Add extra parameters
     if extra_params:
-        params.update(extra_params)
-    return f"{base_url}?{urlencode(params)}"
+        for key, value in extra_params.items():
+            params.append((key, value))
+    
+    # Build URL with proper encoding
+    query_string = "&".join(f"{quote(str(k), safe='[]')}={quote(str(v), safe='')}" for k, v in params)
+    return f"{base_url}/?{query_string}"
 
 # --- Text templates and helpers ---
 ALREADY_PURCHASED_MSG = "Этот курс уже активен у вас."
@@ -306,13 +369,20 @@ def build_main_menu(user_id: int) -> types.ReplyKeyboardMarkup:
 
 def send_catalog_message(user_id: int, edit_message: telebot.types.Message = None, edit_message_id: int = None, edit_chat_id: int = None):
     current_bot = get_current_bot()
+    bot_name = get_bot_context() or CURRENT_BOT_NAME
     try:
         courses = get_courses_data()
+        print(f"[Catalog] Bot: {bot_name}, Total courses loaded: {len(courses)}")
+        for c in courses:
+            print(f"  - ID: {c.get('id')}, Name: {c.get('name')[:30] if c.get('name') else 'N/A'}, Active: {c.get('is_active')}, Image: {c.get('image_url', '')[:50] if c.get('image_url') else 'N/A'}")
     except Exception as e:
-        print(f"Catalog load error: {e}")
+        print(f"Catalog load error for bot {bot_name}: {e}")
+        import traceback
+        traceback.print_exc()
         current_bot.send_message(user_id, get_text_value("catalog_error", CATALOG_ERROR_DEFAULT))
         return
     active_courses = [c for c in courses if c.get("is_active", 1) == 1]
+    print(f"[Catalog] Active courses: {len(active_courses)}")
     if not active_courses:
         current_bot.send_message(user_id, get_text_value("catalog_empty", CATALOG_EMPTY_DEFAULT))
         return
@@ -836,11 +906,13 @@ def handle_admin_google_sheets(message: telebot.types.Message):
         current_bot.send_message(user_id, "У вас нет доступа к этой функции.")
         return
     
-    if not GSHEET_ID:
+    # Get GSHEET_ID from current bot's config
+    gsheet_id = get_current_config().get('GSHEET_ID', '')
+    if not gsheet_id:
         current_bot.send_message(user_id, "Google Sheets ID не настроен.")
         return
     
-    sheets_url = f"https://docs.google.com/spreadsheets/d/{GSHEET_ID}/edit"
+    sheets_url = f"https://docs.google.com/spreadsheets/d/{gsheet_id}/edit"
     
     # Create inline keyboard with URL button
     keyboard = types.InlineKeyboardMarkup()
@@ -878,6 +950,10 @@ def cb_course(c: telebot.types.CallbackQuery):
     duration = course.get("duration_days")  # None if unlimited, int if limited
     image_url = course.get("image_url", "")
     channel_id = course.get("channel", "")
+    
+    # Debug logging
+    print(f"[Course Detail] ID: {course_id}, Name: {name[:30] if name else 'N/A'}")
+    print(f"[Course Detail] Image URL: '{image_url}' (length: {len(image_url) if image_url else 0})")
 
     # Strip all HTML from course name and escape HTML special characters for safe use in HTML markup
     formatted_name = escape_html(strip_html(name)) if name else "Курс"

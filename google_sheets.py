@@ -38,10 +38,13 @@ def get_courses_data(bot_name: str = None):
     """
     if bot_name is None:
         from bot_context import get_bot_context
-        bot_name = get_bot_context() or CURRENT_BOT_NAME
+        context_bot = get_bot_context()
+        bot_name = context_bot or CURRENT_BOT_NAME
+        print(f"[GSheets] get_courses_data: context={context_bot}, using bot={bot_name}")
     
     config = get_bot_config(bot_name)
     gsheet_id = config['GSHEET_ID']
+    print(f"[GSheets] Using GSHEET_ID: {gsheet_id}")
     courses_name = config['GSHEET_COURSES_NAME']
     texts_name = config['GSHEET_TEXTS_NAME']
     use_api = config['GOOGLE_SHEETS_USE_API']
@@ -87,37 +90,58 @@ def get_courses_data(bot_name: str = None):
         data = fetch_sheet_csv(courses_name, gsheet_id)
         if len(data) < 2:
             return []
-        headers = [h.strip() for h in data[0]]
+        headers = [h.strip().lower() for h in data[0]]  # Normalize headers to lowercase
+        print(f"[GSheets] Loaded {len(data)} rows (including header)")
+        print(f"[GSheets] Headers: {headers}")
         courses = []
         for row in data[1:]:
-            if not row or (len(row) > 0 and row[0].strip() == ""):
+            # Skip completely empty rows
+            if not row:
                 continue
-            d = {headers[i]: (row[i] if i < len(row) else "") for i in range(len(headers))}
-            course_id = str(d.get("id") or d.get("ID") or d.get("Id") or "").strip()
+            # Check if row is effectively empty (all cells empty or whitespace)
+            if all(not cell or not str(cell).strip() for cell in row):
+                continue
+            
+            # Build dict from row data
+            d = {}
+            for i, header in enumerate(headers):
+                d[header] = row[i].strip() if i < len(row) else ""
+            
+            # Get course_id - must be non-empty to be valid
+            course_id = str(d.get("id", "") or "").strip()
             if not course_id:
                 continue
-            name = (d.get("name") or d.get("Name") or d.get("Название") or "").strip()
-            desc = (d.get("description") or d.get("Description") or d.get("Описание") or "").strip()
-            price = d.get("price") or d.get("Price") or d.get("Цена") or "0"
-            duration = d.get("duration_days") or d.get("Duration") or d.get("Срок") or d.get("duration_minutes") or ""
-            image = (d.get("image_url") or d.get("Image") or d.get("Картинка") or "").strip()
-            channel = (d.get("channel") or d.get("Channel") or d.get("Канал") or "").strip()
-            # Parse is_active from column H (index 7) or by name
-            is_active_raw = d.get("is_active") or d.get("Is Active") or d.get("isActive") or d.get("Активен") or d.get("active") or "1"
+            
+            # Get name - if empty, skip this row (invalid course)
+            name = (d.get("name", "") or d.get("название", "") or "").strip()
+            if not name:
+                continue
+            
+            desc = (d.get("description", "") or d.get("описание", "") or "").strip()
+            price_str = d.get("price", "") or d.get("цена", "") or "0"
+            duration_str = d.get("duration_days", "") or d.get("duration", "") or d.get("срок", "") or d.get("duration_minutes", "") or ""
+            image = (d.get("image_url", "") or d.get("image", "") or d.get("картинка", "") or "").strip()
+            channel = (d.get("channel", "") or d.get("канал", "") or "").strip()
+            is_active_raw = d.get("is_active", "") or d.get("isactive", "") or d.get("активен", "") or d.get("active", "") or "1"
+            
+            # Parse price
             try:
-                price = float(str(price).replace(",", ".") if price else 0)
+                price = float(str(price_str).replace(",", ".").strip() if price_str else 0)
             except (ValueError, TypeError):
                 price = 0.0
-            # Если duration пустой или 0, то None (бессрочный доступ)
-            duration = parse_duration(duration)
-            # Parse is_active: 1/True/"1"/"true" = active, 0/False/"0"/"false"/empty = inactive
+            
+            # Parse duration (None = unlimited)
+            duration = parse_duration(duration_str)
+            
+            # Parse is_active
             if isinstance(is_active_raw, bool):
                 is_active = 1 if is_active_raw else 0
             elif isinstance(is_active_raw, (int, float)):
                 is_active = 1 if int(is_active_raw) == 1 else 0
             else:
                 is_active_str = str(is_active_raw).strip().lower()
-                is_active = 1 if is_active_str in ("1", "true", "yes", "да", "y") else 0
+                is_active = 1 if is_active_str in ("1", "true", "yes", "да", "y", "") else 0
+            
             courses.append({
                 "id": course_id,
                 "name": name,
@@ -166,17 +190,23 @@ def get_texts_data(bot_name: str = None):
     else:
         data = fetch_sheet_csv(texts_name, gsheet_id)
         texts = {}
-        if not data or len(data) < 2:
+        if not data or len(data) < 1:
             return texts
-        # Assume header row present
-        # But also handle case with no header
-        start_idx = 1
-        # If header doesn't look like keys, fallback to no-header
-        if len(data[0]) < 2 or data[0][0].lower() not in ("key", "ключ"):
-            start_idx = 0
+        
+        # Determine if first row is header
+        start_idx = 0
+        if len(data[0]) >= 2:
+            first_cell = data[0][0].strip().lower()
+            if first_cell in ("key", "ключ", "name", "название"):
+                start_idx = 1
+        
         for row in data[start_idx:]:
-            if len(row) >= 2 and row[0]:
-                key = row[0].strip()
-                value = row[1].strip()
+            # Skip empty rows
+            if not row or len(row) < 2:
+                continue
+            key = str(row[0]).strip() if row[0] else ""
+            value = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+            # Only add if key is not empty
+            if key:
                 texts[key] = value
         return texts
