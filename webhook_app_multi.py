@@ -8,6 +8,7 @@ import telebot
 import threading
 import time
 import sys
+import sqlite3
 from datetime import datetime
 
 from config import get_available_bots, get_bot_config
@@ -269,6 +270,29 @@ for bot_name in bots.keys():
     # Create Prodamus handlers for this bot
     def create_prodamus_handlers(bot_name):
         """Create Prodamus webhook handlers for a specific bot"""
+
+        def remove_pending_payment(db_path: str, order_number: str):
+            """Delete pending payment entry for non-successful payments."""
+            if not order_number:
+                return False
+            try:
+                conn = sqlite3.connect(db_path)
+                cur = conn.cursor()
+                cur.execute("DELETE FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
+                deleted = cur.rowcount
+                conn.commit()
+                conn.close()
+                if deleted:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🧹 Cleared pending payment for {order_number}", file=sys.stderr)
+                return deleted > 0
+            except sqlite3.OperationalError as e:
+                if "no such table" in str(e).lower():
+                    return False
+                print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Failed to clear pending payment: {e}", file=sys.stderr)
+                return False
+            except Exception as e:
+                print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Error clearing pending payment: {e}", file=sys.stderr)
+                return False
         
         @app.route(f"/prodamus/{bot_name}/result", methods=["GET", "POST"], endpoint=f'prodamus_result_{bot_name}')
         def prodamus_result():
@@ -286,7 +310,6 @@ for bot_name in bots.keys():
             )
             from bot_context import set_bot_context, clear_bot_context
             from bot_factory import get_bot_instance
-            import sqlite3
 
             set_bot_context(bot_name)
             bot = get_bot_instance(bot_name)
@@ -311,17 +334,27 @@ for bot_name in bots.keys():
 
                 order_number = data.get("order_num") or data.get("order_id") or data.get("order")
                 amount = data.get("sum") or data.get("amount")
-                payment_status = (data.get("payment_status") or data.get("payment_status_description") or data.get("status") or "").lower()
+                payment_status_raw = (data.get("payment_status") or data.get("payment_status_description") or data.get("status") or "")
+                payment_status = payment_status_raw.strip().lower()
 
                 if not order_number or not amount:
                     print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Missing parameters", file=sys.stderr)
                     return "ERROR: Missing parameters", 400
 
-                if payment_status not in ("success", "paid", "successful"):
-                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Ignored status: {payment_status}", file=sys.stderr)
-                    return "OK", 200
+                success_statuses = ("success", "paid", "successful", "succeeded")
+                failure_statuses = ("fail", "failed", "error", "cancel", "canceled", "cancelled", "rejected", "refunded", "chargeback", "expired")
 
                 db_path = config.get('DATABASE_PATH', f'{bot_name}.db')
+
+                if payment_status in failure_statuses:
+                    remove_pending_payment(db_path, order_number)
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Payment failed/cancelled (status={payment_status})", file=sys.stderr)
+                    return "OK", 200
+
+                if payment_status not in success_statuses:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Ignored interim status: {payment_status_raw}", file=sys.stderr)
+                    return "OK", 200
+
                 try:
                     conn = sqlite3.connect(db_path)
                     cur = conn.cursor()
@@ -362,7 +395,7 @@ for bot_name in bots.keys():
 
                     course_name = course.get("name", "Курс")
                     duration_days = course.get("duration_days")
-                    channel_id = course.get("channel_id")
+                    channel_id = course.get("channel") or course.get("channel_id")
 
                     add_user(user_id, "")
 
