@@ -162,13 +162,17 @@ def get_texts_data(bot_name: str = None):
     """
     if bot_name is None:
         from bot_context import get_bot_context
-        bot_name = get_bot_context() or CURRENT_BOT_NAME
+        context_bot = get_bot_context()
+        bot_name = context_bot or CURRENT_BOT_NAME
+        print(f"[GSheets] get_texts_data: context={context_bot}, using bot={bot_name}")
     
     config = get_bot_config(bot_name)
     gsheet_id = config['GSHEET_ID']
     texts_name = config['GSHEET_TEXTS_NAME']
     use_api = config['GOOGLE_SHEETS_USE_API']
     credentials_file = config['GOOGLE_CREDENTIALS_FILE']
+    
+    print(f"[GSheets] Loading texts from sheet '{texts_name}' (GSHEET_ID: {gsheet_id})")
     
     if use_api:
         try:
@@ -184,29 +188,62 @@ def get_texts_data(bot_name: str = None):
         data = ws.get_all_values()
         texts = {}
         for row in data:
+            # Skip completely empty rows
+            if not row:
+                continue
+            # Check if row is effectively empty (all cells empty or whitespace)
+            if all(not cell or not str(cell).strip() for cell in row):
+                continue
             if len(row) >= 2 and row[0]:
-                texts[row[0]] = row[1]
+                key = str(row[0]).strip()
+                value = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+                if key:
+                    texts[key] = value
+        print(f"[GSheets] Loaded {len(texts)} text entries via API")
         return texts
     else:
         data = fetch_sheet_csv(texts_name, gsheet_id)
         texts = {}
         if not data or len(data) < 1:
+            print(f"[GSheets] No data found in CSV for sheet '{texts_name}'")
             return texts
+        
+        print(f"[GSheets] Loaded {len(data)} rows from CSV (including header if present)")
         
         # Determine if first row is header
         start_idx = 0
-        if len(data[0]) >= 2:
-            first_cell = data[0][0].strip().lower()
-            if first_cell in ("key", "ключ", "name", "название"):
+        if len(data) > 0 and len(data[0]) >= 2:
+            first_cell = str(data[0][0]).strip().lower() if data[0][0] else ""
+            # Check if first row looks like a header
+            if first_cell in ("key", "ключ", "name", "название", "text_key", "ключ_текста"):
+                print(f"[GSheets] Detected header row, skipping: {data[0]}")
                 start_idx = 1
         
-        for row in data[start_idx:]:
-            # Skip empty rows
-            if not row or len(row) < 2:
+        loaded_count = 0
+        for idx, row in enumerate(data[start_idx:], start=start_idx):
+            # Skip completely empty rows
+            if not row:
                 continue
+            # Check if row is effectively empty (all cells empty or whitespace)
+            if all(not cell or not str(cell).strip() for cell in row):
+                continue
+            
+            # Ensure we have at least 2 columns
+            if len(row) < 2:
+                print(f"[GSheets] Row {idx+1} has less than 2 columns, skipping: {row}")
+                continue
+            
             key = str(row[0]).strip() if row[0] else ""
             value = str(row[1]).strip() if len(row) > 1 and row[1] else ""
+            
             # Only add if key is not empty
             if key:
                 texts[key] = value
+                loaded_count += 1
+            else:
+                print(f"[GSheets] Row {idx+1} has empty key, skipping: {row}")
+        
+        print(f"[GSheets] Successfully loaded {loaded_count} text entries from CSV")
+        if loaded_count > 0:
+            print(f"[GSheets] Sample keys: {list(texts.keys())[:5]}")
         return texts
