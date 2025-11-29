@@ -340,21 +340,51 @@ def _get_texts_for_bot(bot_name: str) -> dict:
     now = time.time()
     cached = _texts_cache.get(bot_name)
     if cached and now - cached["ts"] < _TEXTS_CACHE_TTL:
+        print(f"[Texts] Using cached texts for {bot_name} ({len(cached['data'])} entries)")
         return cached["data"]
     try:
+        print(f"[Texts] Loading texts for bot: {bot_name}")
         data = get_texts_data(bot_name) or {}
+        print(f"[Texts] Loaded {len(data)} text entries for {bot_name}")
+        if data:
+            print(f"[Texts] Sample keys: {list(data.keys())[:5]}")
     except Exception as e:
         print(f"[Texts] Failed to load texts for {bot_name}: {e}")
+        import traceback
+        traceback.print_exc()
         data = {}
     _texts_cache[bot_name] = {"ts": now, "data": data}
     return data
 
 def get_text_value(key: str, default: str = "") -> str:
     bot_name = get_bot_context() or CURRENT_BOT_NAME
+    print(f"[Texts] get_text_value called: key='{key}', bot='{bot_name}'")
     texts = _get_texts_for_bot(bot_name)
+    
+    # Try exact match first
     value = texts.get(key)
     if isinstance(value, str) and value.strip():
+        print(f"[Texts] Found value for '{key}': {value[:50]}...")
         return value.strip()
+    
+    # Try case-insensitive match
+    key_lower = key.lower().strip()
+    for k, v in texts.items():
+        if k.lower().strip() == key_lower:
+            if isinstance(v, str) and v.strip():
+                print(f"[Texts] Found value for '{key}' (case-insensitive match with '{k}'): {v[:50]}...")
+                return v.strip()
+    
+    # Try match with spaces/underscores normalized
+    key_normalized = key_lower.replace("_", " ").replace("-", " ")
+    for k, v in texts.items():
+        k_normalized = k.lower().strip().replace("_", " ").replace("-", " ")
+        if k_normalized == key_normalized:
+            if isinstance(v, str) and v.strip():
+                print(f"[Texts] Found value for '{key}' (normalized match with '{k}'): {v[:50]}...")
+                return v.strip()
+    
+    print(f"[Texts] Key '{key}' not found in texts (available keys: {list(texts.keys())[:10]}), using default")
     return default
 
 def build_main_menu(user_id: int) -> types.ReplyKeyboardMarkup:

@@ -21,6 +21,22 @@ app = Flask(__name__)
 bots = initialize_all_bots()
 print(f"[{datetime.now()}] Initialized {len(bots)} bot(s): {', '.join(bots.keys())}")
 
+# Preload texts for all bots at startup
+print(f"[{datetime.now()}] Preloading texts for all bots...")
+try:
+    from google_sheets import get_texts_data
+    for bot_name in bots.keys():
+        try:
+            set_bot_context(bot_name)
+            texts = get_texts_data(bot_name)
+            print(f"[{datetime.now()}] Preloaded {len(texts)} texts for {bot_name}")
+            clear_bot_context()
+        except Exception as e:
+            print(f"[{datetime.now()}] Failed to preload texts for {bot_name}: {e}")
+            clear_bot_context()
+except Exception as e:
+    print(f"[{datetime.now()}] Error during texts preload: {e}")
+
 # Background cleanup scheduler (one per bot)
 _cleanup_threads = {}
 _cleanup_running = {}
