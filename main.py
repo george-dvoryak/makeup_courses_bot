@@ -356,10 +356,12 @@ def _get_texts_for_bot(bot_name: str) -> dict:
     _texts_cache[bot_name] = {"ts": now, "data": data}
     return data
 
-def get_text_value(key: str, default: str = "") -> str:
-    bot_name = get_bot_context() or CURRENT_BOT_NAME
+def get_text_value(key: str, default: str = "", bot_name: str = None) -> str:
+    if bot_name is None:
+        bot_name = get_bot_context() or CURRENT_BOT_NAME
+
     # Добавляем более детальное логирование для отладки
-    print(f"[Texts] get_text_value: key='{key}', context_bot='{get_bot_context()}', resolved_bot='{bot_name}'")
+    print(f"[Texts] get_text_value: key='{key}', bot='{bot_name}', context='{get_bot_context()}'")
 
     if not bot_name:
         print(f"[Texts] ERROR: No bot context found! Using default '{CURRENT_BOT_NAME}'")
@@ -409,7 +411,7 @@ def send_catalog_message(user_id: int, edit_message: telebot.types.Message = Non
     current_bot = get_current_bot()
     bot_name = get_bot_context() or CURRENT_BOT_NAME
     try:
-        courses = get_courses_data()
+        courses = get_courses_data(bot_name)  # Передаем bot_name явно
         print(f"[Catalog] Bot: {bot_name}, Total courses loaded: {len(courses)}")
         for c in courses:
             print(f"  - ID: {c.get('id')}, Name: {c.get('name')[:30] if c.get('name') else 'N/A'}, Active: {c.get('is_active')}, Image: {c.get('image_url', '')[:50] if c.get('image_url') else 'N/A'}")
@@ -417,14 +419,14 @@ def send_catalog_message(user_id: int, edit_message: telebot.types.Message = Non
         print(f"Catalog load error for bot {bot_name}: {e}")
         import traceback
         traceback.print_exc()
-        current_bot.send_message(user_id, get_text_value("catalog_error", CATALOG_ERROR_DEFAULT))
+        current_bot.send_message(user_id, get_text_value("catalog_error", CATALOG_ERROR_DEFAULT, bot_name))
         return
     active_courses = [c for c in courses if c.get("is_active", 1) == 1]
     print(f"[Catalog] Active courses: {len(active_courses)}")
     if not active_courses:
-        current_bot.send_message(user_id, get_text_value("catalog_empty", CATALOG_EMPTY_DEFAULT))
+        current_bot.send_message(user_id, get_text_value("catalog_empty", CATALOG_EMPTY_DEFAULT, bot_name))
         return
-    intro_text = format_text_for_telegram(get_text_value("catalog_intro", CATALOG_INTRO_DEFAULT))
+    intro_text = format_text_for_telegram(get_text_value("catalog_intro", CATALOG_INTRO_DEFAULT, bot_name))
     kb = types.InlineKeyboardMarkup()
     for course in active_courses:
         course_id = course.get("id")
@@ -790,8 +792,9 @@ def handle_prodamus_email(message: telebot.types.Message):
 def handle_start(message: telebot.types.Message):
     current_bot = get_current_bot()
     user_id = message.from_user.id
+    bot_name = get_bot_context() or CURRENT_BOT_NAME
     ensure_user_record(message.from_user)
-    greeting = format_text_for_telegram(get_text_value("greeting_text", "Привет! Я помогу выбрать и оплатить курс."))
+    greeting = format_text_for_telegram(get_text_value("greeting_text", "Привет! Я помогу выбрать и оплатить курс.", bot_name))
     current_bot.send_message(user_id, greeting, parse_mode='HTML', reply_markup=build_main_menu(user_id))
     send_catalog_message(user_id)
 
@@ -804,16 +807,17 @@ def handle_catalog(message: telebot.types.Message):
 def handle_active(message: telebot.types.Message):
     current_bot = get_current_bot()
     user_id = message.from_user.id
+    bot_name = get_bot_context() or CURRENT_BOT_NAME
     ensure_user_record(message.from_user)
     subscriptions = get_active_subscriptions(user_id) or []
     if not subscriptions:
         current_bot.send_message(
             user_id,
-            get_text_value("no_active_subscriptions", NO_ACTIVE_SUBS_DEFAULT),
+            get_text_value("no_active_subscriptions", NO_ACTIVE_SUBS_DEFAULT, bot_name),
             reply_markup=build_main_menu(user_id)
         )
         return
-    header = get_text_value("active_subscriptions_header", ACTIVE_SUBS_HEADER_DEFAULT)
+    header = get_text_value("active_subscriptions_header", ACTIVE_SUBS_HEADER_DEFAULT, bot_name)
     lines = [header, ""]
     links_keyboard = types.InlineKeyboardMarkup()
     has_links = False
@@ -853,8 +857,9 @@ def handle_active(message: telebot.types.Message):
 def handle_support(message: telebot.types.Message):
     current_bot = get_current_bot()
     user_id = message.from_user.id
+    bot_name = get_bot_context() or CURRENT_BOT_NAME
     ensure_user_record(message.from_user)
-    support_text = format_text_for_telegram(get_text_value("support_text", SUPPORT_TEXT_DEFAULT))
+    support_text = format_text_for_telegram(get_text_value("support_text", SUPPORT_TEXT_DEFAULT, bot_name))
     current_bot.send_message(user_id, support_text, parse_mode='HTML', reply_markup=build_main_menu(user_id))
 
 # Handler for "Оферта" button
