@@ -358,33 +358,41 @@ def _get_texts_for_bot(bot_name: str) -> dict:
 
 def get_text_value(key: str, default: str = "") -> str:
     bot_name = get_bot_context() or CURRENT_BOT_NAME
-    print(f"[Texts] get_text_value called: key='{key}', bot='{bot_name}'")
+    # Добавляем более детальное логирование для отладки
+    print(f"[Texts] get_text_value: key='{key}', context_bot='{get_bot_context()}', resolved_bot='{bot_name}'")
+
+    if not bot_name:
+        print(f"[Texts] ERROR: No bot context found! Using default '{CURRENT_BOT_NAME}'")
+        bot_name = CURRENT_BOT_NAME
+
     texts = _get_texts_for_bot(bot_name)
-    
+
     # Try exact match first
     value = texts.get(key)
     if isinstance(value, str) and value.strip():
-        print(f"[Texts] Found value for '{key}': {value[:50]}...")
+        print(f"[Texts] ✅ Found exact match for '{key}': {value[:50]}...")
         return value.strip()
-    
+
     # Try case-insensitive match
     key_lower = key.lower().strip()
     for k, v in texts.items():
         if k.lower().strip() == key_lower:
             if isinstance(v, str) and v.strip():
-                print(f"[Texts] Found value for '{key}' (case-insensitive match with '{k}'): {v[:50]}...")
+                print(f"[Texts] ✅ Found case-insensitive match for '{key}' with '{k}': {v[:50]}...")
                 return v.strip()
-    
+
     # Try match with spaces/underscores normalized
     key_normalized = key_lower.replace("_", " ").replace("-", " ")
     for k, v in texts.items():
         k_normalized = k.lower().strip().replace("_", " ").replace("-", " ")
         if k_normalized == key_normalized:
             if isinstance(v, str) and v.strip():
-                print(f"[Texts] Found value for '{key}' (normalized match with '{k}'): {v[:50]}...")
+                print(f"[Texts] ✅ Found normalized match for '{key}' with '{k}': {v[:50]}...")
                 return v.strip()
-    
-    print(f"[Texts] Key '{key}' not found in texts (available keys: {list(texts.keys())[:10]}), using default")
+
+    print(f"[Texts] ❌ Key '{key}' not found in texts. Available keys: {sorted(texts.keys())[:15]}")
+    if texts:
+        print(f"[Texts] Sample values: {[(k, v[:30]) for k, v in list(texts.items())[:3]]}")
     return default
 
 def build_main_menu(user_id: int) -> types.ReplyKeyboardMarkup:
