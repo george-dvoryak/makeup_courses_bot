@@ -341,37 +341,57 @@ for bot_name in bots.keys():
                 secret_key = config.get('PRODAMUS_SECRET_KEY', '')
                 signature = request.headers.get("Sign") or request.headers.get("sign") or ""
                 
-                # Debug: log raw body for signature verification
-                try:
-                    raw_body_debug = request.get_data(as_text=True)
-                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Raw body length: {len(raw_body_debug) if raw_body_debug else 0}", file=sys.stderr)
-                    if raw_body_debug:
-                        print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Raw body preview (first 200 chars): {raw_body_debug[:200]}", file=sys.stderr)
-                except Exception as e:
-                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Could not get raw body: {e}", file=sys.stderr)
+                # According to Prodamus PHP documentation: Hmac::verify($_POST, $secret_key, $headers['Sign'])
+                # $_POST in PHP contains parsed form data from application/x-www-form-urlencoded
+                # We need to get raw POST body and parse it using prodamuspy (which handles PHP-style arrays)
                 
-                # Parse payload from POST request
-                data = extract_prodamus_payload(request, secret_key)
+                # Get raw POST body (URL-encoded string)
+                raw_body = request.get_data(as_text=True, cache=False)
+                
+                if not raw_body:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Empty POST body", file=sys.stderr)
+                    return "ERROR: Empty payload", 400
+                
+                # Parse using prodamuspy (handles PHP-style array notation like products[0][name])
+                from main import get_prodamus_client
+                client = get_prodamus_client(secret_key)
+                
+                try:
+                    data = client.parse(raw_body)
+                except Exception as e:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Failed to parse payload: {e}", file=sys.stderr)
+                    return "ERROR: Failed to parse payload", 400
 
                 if not data:
-                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Empty payload", file=sys.stderr)
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Empty payload after parsing", file=sys.stderr)
                     return "ERROR: Empty payload", 400
 
                 print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 📨 Payload: {data}", file=sys.stderr)
                 print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔑 Signature header: {signature}", file=sys.stderr)
                 print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔐 Secret key present: {bool(secret_key)}", file=sys.stderr)
-                if secret_key:
-                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔐 Secret key preview: {secret_key[:10]}...{secret_key[-10:] if len(secret_key) > 20 else ''}", file=sys.stderr)
                 
                 forward_to_test_webhook("result", data, request.method)
 
-                # Verify signature using parsed payload dict (as per Prodamus documentation)
-                if secret_key:
-                    if not verify_prodamus_signature(data, secret_key, signature):
-                        print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Invalid signature", file=sys.stderr)
-                        return "ERROR: Invalid signature", 400
-                    else:
-                        print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ✅ Signature verified", file=sys.stderr)
+                # Verify signature using parsed payload dict (as per Prodamus PHP documentation)
+                # Equivalent to: Hmac::verify($_POST, $secret_key, $headers['Sign'])
+                if not signature:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Signature header missing", file=sys.stderr)
+                    return "ERROR: Signature header missing", 400
+                
+                if not secret_key:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Secret key missing", file=sys.stderr)
+                    return "ERROR: Secret key missing", 400
+                
+                # Use client.verify() method (equivalent to Hmac::verify in PHP)
+                if not client.verify(data, signature):
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Invalid signature", file=sys.stderr)
+                    # Debug: show what signature we calculated
+                    calculated_sig = client.sign(data)
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Calculated signature: {calculated_sig}", file=sys.stderr)
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Provided signature: {signature}", file=sys.stderr)
+                    return "ERROR: Invalid signature", 400
+                else:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ✅ Signature verified", file=sys.stderr)
 
                 order_number = data.get("order_num") or data.get("order_id") or data.get("order")
                 amount = data.get("sum") or data.get("amount")

@@ -572,13 +572,10 @@ def verify_prodamus_signature(payload: dict, secret_key: str, signature: str) ->
     """
     Verify Prodamus webhook signature using official prodamuspy library.
     
-    According to Prodamus documentation:
-    - Payload should be parsed dict from POST data (via parse_prodamus_payload)
-    - Signature comes from 'Sign' header
-    - Uses client.verify(payload_dict, signature) method
+    Equivalent to PHP: Hmac::verify($_POST, $secret_key, $headers['Sign'])
     
     Args:
-        payload: Parsed dict from POST request (already parsed via extract_prodamus_payload)
+        payload: Parsed dict from POST request (parsed via prodamuspy.parse())
         secret_key: Prodamus secret key for this bot
         signature: Signature from 'Sign' header
     
@@ -595,6 +592,7 @@ def verify_prodamus_signature(payload: dict, secret_key: str, signature: str) ->
 
     try:
         client = get_prodamus_client(secret_key)
+        # Use client.verify() directly (equivalent to Hmac::verify in PHP)
         is_valid = client.verify(payload, signature)
         
         if not is_valid:
@@ -897,24 +895,42 @@ def prodamus_result():
         secret_key = payment_config.get('PRODAMUS_SECRET_KEY', "")
         signature = request.headers.get("Sign") or request.headers.get("sign") or ""
         
-        # Parse payload from POST request
-        data = extract_prodamus_payload(request, secret_key)
+        # Get raw POST body (URL-encoded string) - equivalent to $_POST in PHP
+        raw_body = request.get_data(as_text=True, cache=False)
+        
+        if not raw_body:
+            print("[Prodamus Result] Empty POST body")
+            return "ERROR: Empty payload", 400
+        
+        # Parse using prodamuspy (handles PHP-style array notation)
+        client = get_prodamus_client(secret_key)
+        try:
+            data = client.parse(raw_body)
+        except Exception as e:
+            print(f"[Prodamus Result] Failed to parse payload: {e}")
+            return "ERROR: Failed to parse payload", 400
 
         if not data:
-            print("[Prodamus Result] Empty payload")
+            print("[Prodamus Result] Empty payload after parsing")
             return "ERROR: Empty payload", 400
 
-        print(f"[Prodamus Result] Headers: {dict(request.headers)}")
         print(f"[Prodamus Result] Payload: {data}")
         print(f"[Prodamus Result] Signature header: {signature}")
         print(f"[Prodamus Result] Secret key present: {bool(secret_key)}")
 
         forward_to_test_webhook("result", data, request.method)
         
-        # Verify signature using parsed payload dict (as per Prodamus documentation)
+        # Verify signature using client.verify() (equivalent to Hmac::verify in PHP)
+        if not signature:
+            print("[Prodamus Result] Signature header missing")
+            return "ERROR: Signature header missing", 400
+        
         if secret_key:
-            if not verify_prodamus_signature(data, secret_key, signature):
-                print("[Prodamus Result] Invalid signature")
+            if not client.verify(data, signature):
+                calculated_sig = client.sign(data)
+                print(f"[Prodamus Result] Invalid signature")
+                print(f"[Prodamus Result] Calculated: {calculated_sig}")
+                print(f"[Prodamus Result] Provided: {signature}")
                 return "ERROR: Invalid signature", 400
             else:
                 print("[Prodamus Result] ✅ Signature verified")
