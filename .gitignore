@@ -59,3 +59,6 @@ logs/
 *.bak
 *.backup
 *~
+
+# Image cache
+.image_cache/

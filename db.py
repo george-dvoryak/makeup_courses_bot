@@ -74,6 +74,17 @@ def init_db(conn):
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS image_cache (
+            image_url TEXT PRIMARY KEY,
+            file_id TEXT,
+            local_path TEXT,
+            cached_at INTEGER,    -- UNIX timestamp (UTC)
+            file_size INTEGER     -- Size in bytes
+        )
+        """
+    )
     conn.commit()
 
 def add_user(user_id: int, username: str = None):

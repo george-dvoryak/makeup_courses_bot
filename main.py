@@ -7,12 +7,16 @@ from telebot import types
 import os
 import time
 import re
+import tempfile
+import hashlib
 from urllib.parse import urlencode, quote
 from flask import Flask, request, abort
 import requests
+from PIL import Image
+from io import BytesIO
 
 from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, ENABLE_PRODAMUS, PRODAMUS_PAYFORM_URL, PRODAMUS_SECRET_KEY, PRODAMUS_TEST_MODE, PRODAMUS_SYSTEM_ID, PRODAMUS_TEST_WEBHOOK_URL, get_bot_config, CURRENT_BOT_NAME
-from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions, clear_all_data
+from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions, clear_all_data, get_connection
 from google_sheets import get_courses_data, get_texts_data
 from bot_context import get_bot_context
 from bot_factory import get_bot_instance
@@ -64,6 +68,230 @@ def get_current_payment_config():
         'PRODAMUS_SYSTEM_ID': config.get('PRODAMUS_SYSTEM_ID', PRODAMUS_SYSTEM_ID),
         'PRODAMUS_TEST_WEBHOOK_URL': config.get('PRODAMUS_TEST_WEBHOOK_URL', PRODAMUS_TEST_WEBHOOK_URL)
     }
+
+# Image caching and optimization
+_IMAGE_CACHE_DIR = os.path.join(os.path.dirname(__file__), '.image_cache')
+_MAX_IMAGE_SIZE = 2 * 1024 * 1024  # 2MB max file size
+_MAX_IMAGE_DIMENSION = 1920  # Max width or height
+_IMAGE_CACHE_TTL = 7 * 24 * 60 * 60  # 7 days
+
+# Create cache directory if it doesn't exist
+os.makedirs(_IMAGE_CACHE_DIR, exist_ok=True)
+
+def _get_image_cache_key(image_url: str) -> str:
+    """Generate cache key for image URL"""
+    return hashlib.md5(image_url.encode()).hexdigest()
+
+def _get_cached_image_info(image_url: str):
+    """Get cached image info from database"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT file_id, local_path, cached_at FROM image_cache WHERE image_url = ?",
+        (image_url,)
+    )
+    row = cur.fetchone()
+    if row:
+        # Check if cache is still valid
+        cached_at = row[2]
+        if time.time() - cached_at < _IMAGE_CACHE_TTL:
+            # Check if local file still exists
+            if row[1] and os.path.exists(row[1]):
+                return {'file_id': row[0], 'local_path': row[1]}
+            else:
+                # Local file missing, remove from cache
+                cur.execute("DELETE FROM image_cache WHERE image_url = ?", (image_url,))
+                conn.commit()
+    return None
+
+def _save_image_cache(image_url: str, file_id: str = None, local_path: str = None):
+    """Save image cache info to database"""
+    conn = get_connection()
+    cur = conn.cursor()
+    file_size = os.path.getsize(local_path) if local_path and os.path.exists(local_path) else 0
+    cur.execute(
+        """
+        INSERT OR REPLACE INTO image_cache (image_url, file_id, local_path, cached_at, file_size)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (image_url, file_id, local_path, int(time.time()), file_size)
+    )
+    conn.commit()
+
+def _download_and_optimize_image(image_url: str) -> str:
+    """
+    Download and optimize image. Returns path to optimized image file.
+    Raises exception if download or optimization fails.
+    """
+    try:
+        print(f"[Image] Downloading: {image_url}")
+        response = requests.get(image_url, timeout=15, stream=True)
+        response.raise_for_status()
+        
+        # Check content type
+        content_type = response.headers.get('content-type', '').lower()
+        if not content_type.startswith('image/'):
+            raise ValueError(f"Not an image: {content_type}")
+        
+        # Download image data
+        image_data = BytesIO()
+        downloaded_size = 0
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                downloaded_size += len(chunk)
+                if downloaded_size > 10 * 1024 * 1024:  # 10MB limit for download
+                    raise ValueError("Image too large to download")
+                image_data.write(chunk)
+        
+        image_data.seek(0)
+        
+        # Open and optimize image
+        print(f"[Image] Optimizing image (size: {downloaded_size} bytes)")
+        img = Image.open(image_data)
+        
+        # Convert to RGB if necessary (for JPEG)
+        if img.mode in ('RGBA', 'LA', 'P'):
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Resize if too large
+        width, height = img.size
+        if width > _MAX_IMAGE_DIMENSION or height > _MAX_IMAGE_DIMENSION:
+            ratio = min(_MAX_IMAGE_DIMENSION / width, _MAX_IMAGE_DIMENSION / height)
+            new_width = int(width * ratio)
+            new_height = int(height * ratio)
+            print(f"[Image] Resizing from {width}x{height} to {new_width}x{new_height}")
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        
+        # Save with compression
+        cache_key = _get_image_cache_key(image_url)
+        local_path = os.path.join(_IMAGE_CACHE_DIR, f"{cache_key}.jpg")
+        
+        # Save with quality optimization to meet size limit
+        quality = 95
+        while quality >= 50:
+            img.save(local_path, 'JPEG', quality=quality, optimize=True)
+            file_size = os.path.getsize(local_path)
+            if file_size <= _MAX_IMAGE_SIZE:
+                print(f"[Image] Optimized: {file_size} bytes (quality: {quality})")
+                return local_path
+            quality -= 5
+        
+        # If still too large after compression, resize more aggressively
+        if os.path.getsize(local_path) > _MAX_IMAGE_SIZE:
+            print(f"[Image] Still too large, resizing more aggressively")
+            img = img.resize((int(img.width * 0.8), int(img.height * 0.8)), Image.Resampling.LANCZOS)
+            img.save(local_path, 'JPEG', quality=85, optimize=True)
+        
+        print(f"[Image] Final size: {os.path.getsize(local_path)} bytes")
+        return local_path
+        
+    except Exception as e:
+        print(f"[Image] Error downloading/optimizing {image_url}: {e}")
+        raise
+
+def send_image_safe(bot, user_id: int, image_url: str, caption: str = "", reply_markup=None, parse_mode='HTML', max_retries: int = 2):
+    """
+    Send image with caching, optimization, and retry logic.
+    Uses file_id if available, otherwise downloads and optimizes image.
+    """
+    if not image_url or not image_url.startswith(('http://', 'https://')):
+        # No valid URL, send text only
+        if caption:
+            bot.send_message(user_id, caption, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
+    
+    try:
+        # Check cache first
+        cached = _get_cached_image_info(image_url)
+        
+        if cached and cached.get('file_id'):
+            # Try to use file_id first (fastest)
+            try:
+                print(f"[Image] Using cached file_id for: {image_url}")
+                bot.send_photo(user_id, cached['file_id'], caption=caption, reply_markup=reply_markup, parse_mode=parse_mode)
+                return
+            except Exception as e:
+                print(f"[Image] file_id expired, downloading: {e}")
+                # file_id expired, continue to download
+        
+        # Download and optimize image
+        local_path = None
+        if cached and cached.get('local_path') and os.path.exists(cached['local_path']):
+            local_path = cached['local_path']
+            print(f"[Image] Using cached local file: {local_path}")
+        else:
+            local_path = _download_and_optimize_image(image_url)
+        
+        # Send image with retry logic
+        file_id = None
+        for attempt in range(max_retries + 1):
+            try:
+                print(f"[Image] Sending image (attempt {attempt + 1}/{max_retries + 1})")
+                with open(local_path, 'rb') as photo:
+                    sent_message = bot.send_photo(user_id, photo, caption=caption, reply_markup=reply_markup, parse_mode=parse_mode)
+                    # Extract file_id from sent message
+                    if sent_message and sent_message.photo:
+                        file_id = sent_message.photo[-1].file_id  # Get largest size
+                        print(f"[Image] ✅ Sent successfully, file_id: {file_id}")
+                        break
+            except Exception as e:
+                print(f"[Image] ❌ Attempt {attempt + 1} failed: {e}")
+                if attempt < max_retries:
+                    time.sleep(1)  # Wait before retry
+                else:
+                    raise
+        
+        # Save to cache
+        if file_id and local_path:
+            _save_image_cache(image_url, file_id, local_path)
+            
+    except Exception as e:
+        print(f"[Image] ❌ Failed to send image, sending text only: {e}")
+        # Fallback: send text only
+        if caption:
+            try:
+                bot.send_message(user_id, caption, reply_markup=reply_markup, parse_mode=parse_mode)
+            except Exception as e2:
+                print(f"[Image] ❌ Even text fallback failed: {e2}")
+
+def cleanup_old_images():
+    """Clean up old cached images from disk and database"""
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        now = int(time.time())
+        
+        # Find old cache entries
+        cur.execute(
+            "SELECT image_url, local_path FROM image_cache WHERE cached_at < ?",
+            (now - _IMAGE_CACHE_TTL,)
+        )
+        old_entries = cur.fetchall()
+        
+        removed_count = 0
+        for row in old_entries:
+            local_path = row[1]
+            if local_path and os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                    removed_count += 1
+                except Exception as e:
+                    print(f"[Image] Failed to remove {local_path}: {e}")
+        
+        # Remove from database
+        cur.execute("DELETE FROM image_cache WHERE cached_at < ?", (now - _IMAGE_CACHE_TTL,))
+        conn.commit()
+        
+        if removed_count > 0:
+            print(f"[Image] Cleaned up {removed_count} old cached images")
+    except Exception as e:
+        print(f"[Image] Error during cleanup: {e}")
 
 def get_prodamus_client(secret_key: str) -> ProdamusPy:
     """Create Prodamus client helper"""
@@ -463,12 +691,7 @@ def send_catalog_message(user_id: int, edit_message: telebot.types.Message = Non
 
     # Отправляем картинку каталога, если указана
     if catalog_image_url:
-        try:
-            current_bot.send_photo(user_id, catalog_image_url, caption=text, reply_markup=kb, parse_mode='HTML')
-        except Exception as e:
-            print(f"[Catalog] Failed to send catalog image: {e}")
-            # Если картинка не отправилась, отправляем только текст
-            current_bot.send_message(user_id, text, reply_markup=kb, parse_mode='HTML')
+        send_image_safe(current_bot, user_id, catalog_image_url, caption=text, reply_markup=kb, parse_mode='HTML')
     else:
         current_bot.send_message(user_id, text, reply_markup=kb, parse_mode='HTML')
 
@@ -817,12 +1040,7 @@ def handle_start(message: telebot.types.Message):
     # Отправляем картинку приветствия, если указана
     welcome_image_url = get_text_value("welcome_image_url", "", bot_name).strip()
     if welcome_image_url:
-        try:
-            current_bot.send_photo(user_id, welcome_image_url, caption=greeting, parse_mode='HTML', reply_markup=build_main_menu(user_id))
-        except Exception as e:
-            print(f"[Start] Failed to send welcome image: {e}")
-            # Если картинка не отправилась, отправляем только текст
-            current_bot.send_message(user_id, greeting, parse_mode='HTML', reply_markup=build_main_menu(user_id))
+        send_image_safe(current_bot, user_id, welcome_image_url, caption=greeting, reply_markup=build_main_menu(user_id), parse_mode='HTML')
     else:
         current_bot.send_message(user_id, greeting, parse_mode='HTML', reply_markup=build_main_menu(user_id))
 
@@ -1113,7 +1331,7 @@ def cb_course(c: telebot.types.CallbackQuery):
                     except Exception:
                         pass
             # Send new photo (either because original wasn't photo, or edit/delete failed)
-            current_bot.send_photo(user_id, image_url, caption=text, reply_markup=ikb, parse_mode='HTML')
+            send_image_safe(current_bot, user_id, image_url, caption=text, reply_markup=ikb, parse_mode='HTML')
             message_sent = True
         else:
             # No course image - edit text or send new message

@@ -52,7 +52,13 @@ def run_cleanup(bot_name: str):
         set_bot_context(bot_name)
         bot = get_bot_instance(bot_name)
         
-        from main import remove_user_from_channel, strip_html
+        from main import remove_user_from_channel, strip_html, cleanup_old_images
+        
+        # Clean up old cached images
+        try:
+            cleanup_old_images()
+        except Exception as e:
+            print(f"[{datetime.now()}] [Auto-Cleanup-{bot_name}] Error cleaning up images: {e}")
         
         expired = get_expired_subscriptions()
         if not expired:
