@@ -75,7 +75,6 @@ _IMAGE_CACHE_DIR = os.path.join(os.path.dirname(__file__), '.image_cache')
 _MAX_IMAGE_SIZE = 2 * 1024 * 1024  # 2MB max file size
 _MAX_IMAGE_DIMENSION = 1920  # Max width or height
 _IMAGE_CACHE_TTL = 7 * 24 * 60 * 60  # 7 days
-TELEGRAM_CAPTION_LIMIT = 1024  # Telegram photo caption limit
 
 # Create cache directory if it doesn't exist
 os.makedirs(_IMAGE_CACHE_DIR, exist_ok=True)
@@ -208,12 +207,6 @@ def send_image_safe(bot, user_id: int, image_url: str, caption: str = "", reply_
             bot.send_message(user_id, caption, reply_markup=reply_markup, parse_mode=parse_mode)
         return
     
-    caption_to_use = ""
-    overflow_text = ""
-    if caption:
-        caption_to_use, overflow_text = prepare_media_caption(caption, parse_mode=parse_mode)
-    caption_was_trimmed = bool(overflow_text)
-    
     try:
         # Check cache first
         cached = _get_cached_image_info(image_url)
@@ -222,9 +215,7 @@ def send_image_safe(bot, user_id: int, image_url: str, caption: str = "", reply_
             # Try to use file_id first (fastest)
             try:
                 print(f"[Image] Using cached file_id for: {image_url}")
-                bot.send_photo(user_id, cached['file_id'], caption=caption_to_use, reply_markup=reply_markup, parse_mode=parse_mode)
-                if caption_was_trimmed and overflow_text:
-                    bot.send_message(user_id, overflow_text, parse_mode=parse_mode)
+                bot.send_photo(user_id, cached['file_id'], caption=caption, reply_markup=reply_markup, parse_mode=parse_mode)
                 return
             except Exception as e:
                 print(f"[Image] file_id expired, downloading: {e}")
@@ -240,17 +231,15 @@ def send_image_safe(bot, user_id: int, image_url: str, caption: str = "", reply_
         
         # Send image with retry logic
         file_id = None
-        photo_sent = False
         for attempt in range(max_retries + 1):
             try:
                 print(f"[Image] Sending image (attempt {attempt + 1}/{max_retries + 1})")
                 with open(local_path, 'rb') as photo:
-                    sent_message = bot.send_photo(user_id, photo, caption=caption_to_use, reply_markup=reply_markup, parse_mode=parse_mode)
+                    sent_message = bot.send_photo(user_id, photo, caption=caption, reply_markup=reply_markup, parse_mode=parse_mode)
                     # Extract file_id from sent message
                     if sent_message and sent_message.photo:
                         file_id = sent_message.photo[-1].file_id  # Get largest size
                         print(f"[Image] ✅ Sent successfully, file_id: {file_id}")
-                        photo_sent = True
                         break
             except Exception as e:
                 print(f"[Image] ❌ Attempt {attempt + 1} failed: {e}")
@@ -258,12 +247,6 @@ def send_image_safe(bot, user_id: int, image_url: str, caption: str = "", reply_
                     time.sleep(1)  # Wait before retry
                 else:
                     raise
-        
-        if photo_sent and caption_was_trimmed and overflow_text:
-            try:
-                bot.send_message(user_id, overflow_text, parse_mode=parse_mode)
-            except Exception as extra_err:
-                print(f"[Image] Failed to send extended description: {extra_err}")
         
         # Save to cache
         if file_id and local_path:
@@ -531,48 +514,6 @@ def format_text_for_telegram(text: str) -> str:
         text = text.replace(f"__PROTECTED_TAG_{i}__", tag)
 
     return text
-
-def prepare_media_caption(text: str, limit: int = TELEGRAM_CAPTION_LIMIT, parse_mode: str = 'HTML'):
-    """
-    Ensure caption length is safe for Telegram media messages.
-    Returns tuple of (caption_to_send, extra_text) where extra_text is non-empty
-    when original text exceeded Telegram's caption limit.
-    """
-    if not text:
-        return "", ""
-    
-    text = text.strip()
-    if not text:
-        return "", ""
-    
-    if len(text) <= limit:
-        return text, ""
-    
-    is_html = bool(parse_mode and parse_mode.upper() == 'HTML')
-    plain_text = strip_html(text).strip() if is_html else text
-    if not plain_text:
-        plain_text = text
-    
-    truncated = plain_text[:limit - 1].rstrip()
-    if len(plain_text) > limit - 1:
-        truncated = f"{truncated}…"
-    
-    if is_html:
-        safe_caption = escape_html(truncated)
-        # Escape may expand entities, ensure final caption still within limit
-        while len(safe_caption) > limit and len(truncated) > 1:
-            truncated = truncated[:-1].rstrip()
-            temp = truncated if truncated.endswith("…") else f"{truncated}…"
-            safe_caption = escape_html(temp)
-    else:
-        safe_caption = truncated
-        if len(safe_caption) > limit:
-            safe_caption = safe_caption[:limit - 1].rstrip()
-            if not safe_caption.endswith("…"):
-                safe_caption = f"{safe_caption}…"
-    
-    print(f"[Caption] Trimmed caption to {len(safe_caption)}/{limit} chars (original: {len(text)})")
-    return safe_caption, text
 
 # Payment helper functions
 def rub_to_kopecks(rub: float) -> int:
@@ -1372,16 +1313,7 @@ def cb_course(c: telebot.types.CallbackQuery):
         ikb.add(types.InlineKeyboardButton("⬅️ Назад к каталогу", callback_data="back_to_catalog"))
         try:
             if c.message.content_type == "photo":
-                safe_caption, extra_text = prepare_media_caption(text, parse_mode='HTML')
-                current_bot.edit_message_caption(
-                    chat_id=c.message.chat.id,
-                    message_id=c.message.message_id,
-                    caption=safe_caption,
-                    reply_markup=ikb,
-                    parse_mode='HTML'
-                )
-                if extra_text:
-                    current_bot.send_message(user_id, extra_text, parse_mode='HTML')
+                current_bot.edit_message_caption(chat_id=c.message.chat.id, message_id=c.message.message_id, caption=text, reply_markup=ikb, parse_mode='HTML')
             else:
                 current_bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb, parse_mode='HTML')
         except Exception:
@@ -1417,15 +1349,12 @@ def cb_course(c: telebot.types.CallbackQuery):
             if c.message.content_type == "photo":
                 # Try to edit photo
                 try:
-                    safe_caption, extra_text = prepare_media_caption(text, parse_mode='HTML')
                     current_bot.edit_message_media(
                         chat_id=c.message.chat.id,
                         message_id=c.message.message_id,
-                        media=types.InputMediaPhoto(image_url, caption=safe_caption or None, parse_mode='HTML'),
+                        media=types.InputMediaPhoto(image_url, caption=text, parse_mode='HTML'),
                         reply_markup=ikb
                     )
-                    if extra_text:
-                        current_bot.send_message(user_id, extra_text, parse_mode='HTML')
                     current_bot.answer_callback_query(c.id)
                     return
                 except Exception as e:
@@ -2163,13 +2092,7 @@ def send_broadcast_messages(recipients: list, text: str, bot_instance, photo_fil
         try:
             if photo_file_id:
                 # Send photo with caption
-                caption_to_send = text
-                extra_text = ""
-                if text:
-                    caption_to_send, extra_text = prepare_media_caption(text, parse_mode=None)
-                bot_instance.send_photo(uid, photo_file_id, caption=caption_to_send, disable_web_page_preview=True, timeout=10)
-                if extra_text:
-                    bot_instance.send_message(uid, extra_text, disable_web_page_preview=True, timeout=10)
+                bot_instance.send_photo(uid, photo_file_id, caption=text, disable_web_page_preview=True, timeout=10)
             else:
                 # Send text only
                 bot_instance.send_message(uid, text, disable_web_page_preview=True, timeout=10)

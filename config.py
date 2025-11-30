@@ -22,7 +22,7 @@ CURRENT_BOT_NAME = os.getenv("BOT_NAME", "default")
 
 
 def _is_placeholder_token(token: str) -> bool:
-    """Detect placeholder tokens like 'ваш_токен' or empty values."""
+    """Detect placeholder tokens like 'ваш_токен' or 'your_token', or empty values."""
     if not token:
         return True
     token_str = str(token).strip()
@@ -57,6 +57,7 @@ def _build_minimal_config() -> dict:
         'GOOGLE_SHEETS_USE_API': False,
         'GOOGLE_CREDENTIALS_FILE': 'google_credentials.json',
     }
+
 
 # Dictionary to store bot configurations
 _bot_configs = {}
