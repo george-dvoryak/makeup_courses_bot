@@ -53,7 +53,7 @@ try:
             print(f"✅ Загружено {len(texts)} текстов")
 
             # Проверяем основные ключи
-            required_keys = ['greeting_text', 'catalog_intro', 'catalog_empty', 'catalog_error']
+            required_keys = ['greeting_text', 'catalog_intro', 'catalog_empty', 'catalog_error', 'support_text']
             optional_keys = ['welcome_image_url', 'catalog_image_url']
 
             print("\nПРОВЕРКА ОСНОВНЫХ КЛЮЧЕЙ:")

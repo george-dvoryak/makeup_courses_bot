@@ -447,7 +447,7 @@ def send_catalog_message(user_id: int, edit_message: telebot.types.Message = Non
         except (TypeError, ValueError):
             pass
         kb.add(types.InlineKeyboardButton(label[:64], callback_data=f"course_{course_id}"))
-    text = f"{intro_text}\n\nДоступно курсов: {len(active_courses)}"
+    text = intro_text
     target_chat = edit_chat_id or (edit_message.chat.id if edit_message else None)
     target_msg = edit_message_id or (edit_message.message_id if edit_message else None)
     if target_chat and target_msg:
