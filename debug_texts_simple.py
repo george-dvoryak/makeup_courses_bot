@@ -54,6 +54,7 @@ try:
 
             # Проверяем основные ключи
             required_keys = ['greeting_text', 'catalog_intro', 'catalog_empty', 'catalog_error']
+            optional_keys = ['welcome_image_url', 'catalog_image_url']
 
             print("\nПРОВЕРКА ОСНОВНЫХ КЛЮЧЕЙ:")
             for key in required_keys:
@@ -62,6 +63,14 @@ try:
                     print(f"✅ {key}: {value}")
                 else:
                     print(f"❌ {key}: НЕ НАЙДЕН")
+
+            print("\nПРОВЕРКА ОПЦИОНАЛЬНЫХ КЛЮЧЕЙ (для картинок):")
+            for key in optional_keys:
+                if key in texts and texts[key].strip():
+                    value = texts[key][:60] + "..." if len(texts[key]) > 60 else texts[key]
+                    print(f"✅ {key}: {value}")
+                else:
+                    print(f"⚠️  {key}: НЕ ЗАДАН (картинка не будет отправляться)")
 
             print(f"\nВСЕ ДОСТУПНЫЕ КЛЮЧИ ({len(texts)}):")
             for key in sorted(texts.keys()):

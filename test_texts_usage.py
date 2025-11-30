@@ -84,7 +84,9 @@ try:
                 "support_text",
                 "no_active_subscriptions",
                 "active_subscriptions_header",
-                "purchase_success_message"
+                "purchase_success_message",
+                "welcome_image_url",
+                "catalog_image_url"
             ]
 
             for key in standard_keys:

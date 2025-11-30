@@ -28,7 +28,9 @@
 | Ключ | Значение |
 |------|----------|
 | greeting_text | Привет! Я помогу выбрать и оплатить курс. |
+| welcome_image_url | https://example.com/welcome.jpg | (опционально)
 | catalog_intro | 📚 Каталог курсов\nВыберите интересующий курс: |
+| catalog_image_url | https://example.com/catalog.jpg | (опционально)
 | ... | ... |
 
 **Важно:**

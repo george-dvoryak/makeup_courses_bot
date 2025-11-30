@@ -427,6 +427,10 @@ def send_catalog_message(user_id: int, edit_message: telebot.types.Message = Non
         current_bot.send_message(user_id, get_text_value("catalog_empty", CATALOG_EMPTY_DEFAULT, bot_name))
         return
     intro_text = format_text_for_telegram(get_text_value("catalog_intro", CATALOG_INTRO_DEFAULT, bot_name))
+
+    # Получаем URL картинки каталога
+    catalog_image_url = get_text_value("catalog_image_url", "", bot_name).strip()
+
     kb = types.InlineKeyboardMarkup()
     for course in active_courses:
         course_id = course.get("id")
@@ -452,7 +456,17 @@ def send_catalog_message(user_id: int, edit_message: telebot.types.Message = Non
             return
         except Exception as e:
             print(f"Failed to edit catalog message: {e}")
-    current_bot.send_message(user_id, text, reply_markup=kb, parse_mode='HTML')
+
+    # Отправляем картинку каталога, если указана
+    if catalog_image_url:
+        try:
+            current_bot.send_photo(user_id, catalog_image_url, caption=text, reply_markup=kb, parse_mode='HTML')
+        except Exception as e:
+            print(f"[Catalog] Failed to send catalog image: {e}")
+            # Если картинка не отправилась, отправляем только текст
+            current_bot.send_message(user_id, text, reply_markup=kb, parse_mode='HTML')
+    else:
+        current_bot.send_message(user_id, text, reply_markup=kb, parse_mode='HTML')
 
 def ensure_user_record(user: telebot.types.User):
     if not user:
@@ -795,8 +809,18 @@ def handle_start(message: telebot.types.Message):
     bot_name = get_bot_context() or CURRENT_BOT_NAME
     ensure_user_record(message.from_user)
     greeting = format_text_for_telegram(get_text_value("greeting_text", "Привет! Я помогу выбрать и оплатить курс.", bot_name))
-    current_bot.send_message(user_id, greeting, parse_mode='HTML', reply_markup=build_main_menu(user_id))
-    send_catalog_message(user_id)
+
+    # Отправляем картинку приветствия, если указана
+    welcome_image_url = get_text_value("welcome_image_url", "", bot_name).strip()
+    if welcome_image_url:
+        try:
+            current_bot.send_photo(user_id, welcome_image_url, caption=greeting, parse_mode='HTML', reply_markup=build_main_menu(user_id))
+        except Exception as e:
+            print(f"[Start] Failed to send welcome image: {e}")
+            # Если картинка не отправилась, отправляем только текст
+            current_bot.send_message(user_id, greeting, parse_mode='HTML', reply_markup=build_main_menu(user_id))
+    else:
+        current_bot.send_message(user_id, greeting, parse_mode='HTML', reply_markup=build_main_menu(user_id))
 
 @bot.message_handler(func=lambda m: m.text == "Каталог")
 def handle_catalog(message: telebot.types.Message):
