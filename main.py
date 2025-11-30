@@ -19,7 +19,7 @@ from io import BytesIO
 from config import TELEGRAM_BOT_TOKEN, PAYMENT_PROVIDER_TOKEN, ADMIN_IDS, CURRENCY, USE_WEBHOOK, DATABASE_PATH, GSHEET_ID, ENABLE_PRODAMUS, PRODAMUS_PAYFORM_URL, PRODAMUS_SECRET_KEY, PRODAMUS_TEST_MODE, PRODAMUS_SYSTEM_ID, PRODAMUS_TEST_WEBHOOK_URL, get_bot_config, CURRENT_BOT_NAME
 from db import add_user, get_user, add_purchase, get_active_subscriptions, has_active_subscription, mark_subscription_expired, get_all_active_subscriptions, clear_all_data, get_connection
 from google_sheets import get_courses_data, get_texts_data
-from bot_context import get_bot_context
+from bot_context import get_bot_context, set_bot_context
 from bot_factory import get_bot_instance
 from prodamuspy import ProdamusPy  # type: ignore
 
@@ -430,28 +430,34 @@ def get_admin_broadcast_state():
         admin_broadcast_state[bot_name] = {}
     return admin_broadcast_state[bot_name]
 
-def safe_answer_callback_query(bot, callback_query_id: str, text: str = None, show_alert: bool = False, max_retries: int = 2):
+def safe_answer_callback_query(bot, callback_query_id: str, text: str = None, show_alert: bool = False, max_retries: int = 3):
     """
     Safely answer callback query with SSL error handling and retry logic.
+    Handles various network errors and retries with exponential backoff.
     """
     for attempt in range(max_retries + 1):
         try:
-            bot.answer_callback_query(callback_query_id, text=text, show_alert=show_alert)
+            bot.answer_callback_query(callback_query_id, text=text, show_alert=show_alert, timeout=5)
             return True
         except Exception as e:
             error_msg = str(e).lower()
-            # Check if it's an SSL error or connection error
-            if "ssl" in error_msg or "connection" in error_msg or "decryption" in error_msg:
-                if attempt < max_retries:
-                    print(f"[Callback] SSL/Connection error (attempt {attempt + 1}/{max_retries + 1}), retrying...")
-                    time.sleep(0.5 * (attempt + 1))  # Exponential backoff
-                    continue
-                else:
-                    print(f"[Callback] Failed to answer callback_query after {max_retries + 1} attempts: {e}")
-                    return False
+            # Check if it's a retryable error (SSL, connection, timeout, etc.)
+            is_retryable = any(keyword in error_msg for keyword in [
+                "ssl", "connection", "decryption", "timeout", "bad record mac",
+                "max retries", "connection pool", "network", "temporary failure"
+            ])
+            
+            if is_retryable and attempt < max_retries:
+                wait_time = 0.5 * (attempt + 1)  # Exponential backoff: 0.5s, 1s, 1.5s
+                print(f"[Callback] Retryable error (attempt {attempt + 1}/{max_retries + 1}): {type(e).__name__}, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                continue
             else:
-                # Other errors - don't retry
-                print(f"[Callback] Error answering callback_query: {e}")
+                # Non-retryable error or max retries reached
+                if attempt >= max_retries:
+                    print(f"[Callback] Failed to answer callback_query after {max_retries + 1} attempts: {type(e).__name__}: {e}")
+                else:
+                    print(f"[Callback] Non-retryable error answering callback_query: {type(e).__name__}: {e}")
                 return False
     return False
 
@@ -590,6 +596,7 @@ CATALOG_ERROR_DEFAULT = "Не удалось загрузить каталог. 
 SUPPORT_TEXT_DEFAULT = "Напишите нам в поддержку: @your_support или info@example.com"
 NO_ACTIVE_SUBS_DEFAULT = "У вас пока нет активных подписок."
 ACTIVE_SUBS_HEADER_DEFAULT = "📘 Ваши активные курсы:"
+OFERTA_URL_DEFAULT = "https://github.com/george-dvoryak/cdn/blob/main/oferta.pdf?raw=true"
 
 _texts_cache = {}
 _TEXTS_CACHE_TTL = 300  # seconds
@@ -1139,7 +1146,8 @@ def handle_support(message: telebot.types.Message):
 def handle_oferta(message: telebot.types.Message):
     current_bot = get_current_bot()
     user_id = message.from_user.id
-    oferta_url = "https://github.com/george-dvoryak/cdn/blob/main/oferta.pdf?raw=true"
+    bot_name = get_bot_context() or CURRENT_BOT_NAME
+    oferta_url = get_text_value("oferta_url", OFERTA_URL_DEFAULT, bot_name)
     try:
         current_bot.send_document(user_id, oferta_url, caption="Договор оферты (PDF)")
     except Exception:
@@ -2066,10 +2074,10 @@ def handle_broadcast(message: telebot.types.Message):
         reply_msg += f" Не удалось отправить: {failed}."
     current_bot.reply_to(message, reply_msg)
 
-def send_broadcast_messages(recipients: list, text: str, photo_file_id: str = None, progress_callback=None):
-    current_bot = get_current_bot()
+def send_broadcast_messages(recipients: list, text: str, bot_instance, photo_file_id: str = None, progress_callback=None):
     """
     Send broadcast messages to recipients with rate limiting.
+    bot_instance: TeleBot instance to use for sending messages
     progress_callback: Optional function(sent, failed, total) called periodically
     Returns tuple (sent_count, failed_count)
     """
@@ -2077,55 +2085,86 @@ def send_broadcast_messages(recipients: list, text: str, photo_file_id: str = No
     failed = 0
     total = len(recipients)
     last_progress_update = 0
+    consecutive_errors = 0
+    max_consecutive_errors = 10  # Stop if too many consecutive errors
     
     for idx, uid in enumerate(recipients, 1):
         try:
             if photo_file_id:
                 # Send photo with caption
-                current_bot.send_photo(uid, photo_file_id, caption=text, disable_web_page_preview=True)
+                bot_instance.send_photo(uid, photo_file_id, caption=text, disable_web_page_preview=True, timeout=10)
             else:
                 # Send text only
-                current_bot.send_message(uid, text, disable_web_page_preview=True)
+                bot_instance.send_message(uid, text, disable_web_page_preview=True, timeout=10)
             sent += 1
+            consecutive_errors = 0  # Reset error counter on success
             
-            # Update progress every 10 messages or every 2 seconds
-            if progress_callback and (idx % 10 == 0 or time.time() - last_progress_update > 2):
+            # Update progress every 10 messages or every 3 seconds
+            if progress_callback and (idx % 10 == 0 or time.time() - last_progress_update > 3):
                 try:
                     progress_callback(sent, failed, total)
                     last_progress_update = time.time()
                 except Exception as e:
-                    print(f"[Broadcast] Progress callback error: {e}")
+                    # Don't let progress callback errors stop the broadcast
+                    if idx % 50 == 0:  # Log only occasionally
+                        print(f"[Broadcast] Progress callback error: {e}")
             
-            # Rate limiting: delay every 20 messages to avoid Telegram limits
-            if idx % 20 == 0 and idx < total:
-                time.sleep(0.05)  # 50ms delay every 20 messages
+            # Rate limiting: delay every 10 messages to stay well under Telegram limits
+            # Telegram allows ~30 messages/second, we'll do ~10/second to be safe
+            if idx % 10 == 0 and idx < total:
+                time.sleep(0.1)  # 100ms delay every 10 messages
                 
         except Exception as e:
             failed += 1
+            consecutive_errors += 1
             error_msg = str(e).lower()
             
             # Handle specific error types
-            if "chat not found" in error_msg or "bot was blocked" in error_msg:
-                # User blocked bot - not a real failure, just skip
+            if "chat not found" in error_msg or "bot was blocked" in error_msg or "user is deactivated" in error_msg:
+                # User blocked bot or deleted account - not a real failure, just skip
+                consecutive_errors = 0  # Don't count blocked users as consecutive errors
                 pass
             elif "too many requests" in error_msg or "rate limit" in error_msg:
-                # Rate limit hit - wait longer
-                print(f"[Broadcast] Rate limit hit at message {idx}, waiting 1 second...")
-                time.sleep(1)
+                # Rate limit hit - wait longer and retry
+                wait_time = 2  # Start with 2 seconds
+                if "retry after" in error_msg:
+                    # Try to extract retry_after value
+                    try:
+                        import re
+                        match = re.search(r'retry after (\d+)', error_msg)
+                        if match:
+                            wait_time = int(match.group(1)) + 1
+                    except:
+                        pass
+                
+                print(f"[Broadcast] Rate limit hit at message {idx}, waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+                consecutive_errors = 0  # Reset on retry
+                
                 # Retry this message
                 try:
                     if photo_file_id:
-                        current_bot.send_photo(uid, photo_file_id, caption=text, disable_web_page_preview=True)
+                        bot_instance.send_photo(uid, photo_file_id, caption=text, disable_web_page_preview=True, timeout=10)
                     else:
-                        current_bot.send_message(uid, text, disable_web_page_preview=True)
+                        bot_instance.send_message(uid, text, disable_web_page_preview=True, timeout=10)
                     sent += 1
                     failed -= 1
                 except Exception as e2:
                     print(f"[Broadcast] Retry failed for user {uid}: {e2}")
+            elif "timeout" in error_msg or "connection" in error_msg or "ssl" in error_msg:
+                # Network error - wait a bit and continue
+                print(f"[Broadcast] Network error for user {uid}, waiting 0.5s...")
+                time.sleep(0.5)
+                # Don't retry immediately, just continue
             else:
                 # Log first few failures for debugging
                 if failed <= 5:
                     print(f"[Broadcast] Failed to send to user {uid}: {e}")
+            
+            # Stop if too many consecutive errors (might indicate a bigger problem)
+            if consecutive_errors >= max_consecutive_errors:
+                print(f"[Broadcast] Too many consecutive errors ({consecutive_errors}), stopping broadcast")
+                break
         
         # Update progress at the end of loop iteration if needed
         if progress_callback and idx == total:
@@ -2242,8 +2281,10 @@ def handle_broadcast_text(message: telebot.types.Message):
     if state.get("photo"):
         # Answer callback immediately if this was triggered by callback
         # (though this is a message handler, so no callback to answer)
+        # Get bot_name for context in background thread
+        bot_name = get_bot_context() or CURRENT_BOT_NAME
         # Execute broadcast in background thread (non-blocking)
-        thread = threading.Thread(target=execute_broadcast, args=(user_id, state), daemon=True)
+        thread = threading.Thread(target=execute_broadcast, args=(user_id, state, bot_name), daemon=True)
         thread.start()
     else:
         # Ask if want to add photo or send now
@@ -2318,8 +2359,10 @@ def cb_broadcast_send(c: telebot.types.CallbackQuery):
     # Answer callback immediately to prevent timeout
     safe_answer_callback_query(current_bot, c.id, "Начинаю рассылку...")
     
+    # Get bot_name for context in background thread
+    bot_name = get_bot_context() or CURRENT_BOT_NAME
     # Execute broadcast in background thread (non-blocking)
-    thread = threading.Thread(target=execute_broadcast, args=(user_id, state), daemon=True)
+    thread = threading.Thread(target=execute_broadcast, args=(user_id, state, bot_name), daemon=True)
     thread.start()
 
 # Add photo callback
@@ -2342,11 +2385,19 @@ def cb_broadcast_add_photo(c: telebot.types.CallbackQuery):
     
     safe_answer_callback_query(current_bot, c.id)
 
-def execute_broadcast(user_id: int, state: dict):
+def execute_broadcast(user_id: int, state: dict, bot_name: str = None):
     """
     Execute broadcast with given state.
     This function runs in a background thread to avoid blocking webhook handlers.
+    bot_name: Name of the bot to use (required for multi-bot context)
     """
+    # Set bot context for this thread (critical for multi-bot support)
+    if bot_name:
+        set_bot_context(bot_name)
+        print(f"[Broadcast] Starting broadcast for bot '{bot_name}', user {user_id}")
+    else:
+        print(f"[Broadcast] Warning: No bot_name provided, using default bot context")
+    
     current_bot = get_current_bot()
     broadcast_state = get_admin_broadcast_state()
     
@@ -2356,8 +2407,10 @@ def execute_broadcast(user_id: int, state: dict):
         photo = state.get("photo")
         
         if not broadcast_type or not text:
+            error_msg = "❌ Ошибка: не указан тип рассылки или текст."
+            print(f"[Broadcast] {error_msg} (type={broadcast_type}, has_text={bool(text)})")
             try:
-                current_bot.send_message(user_id, "❌ Ошибка: не указан тип рассылки или текст.")
+                current_bot.send_message(user_id, error_msg)
             except Exception as e:
                 print(f"[Broadcast] Failed to send error message: {e}")
             finally:
@@ -2411,70 +2464,147 @@ def execute_broadcast(user_id: int, state: dict):
         }
         progress_msg = None
         try:
-            progress_msg = current_bot.send_message(user_id, f"📤 Отправка рассылки {type_names.get(broadcast_type, '')}...\nПолучателей: {len(recipients)}\nОтправлено: 0")
+            initial_text = f"📤 Отправка рассылки {type_names.get(broadcast_type, '')}...\nПолучателей: {len(recipients)}\nОтправлено: 0"
+            progress_msg = current_bot.send_message(user_id, initial_text, timeout=10)
+            print(f"[Broadcast] Initial progress message sent. Recipients: {len(recipients)}")
+            # Small delay to ensure message is sent before starting broadcast
+            time.sleep(0.2)
         except Exception as e:
             print(f"[Broadcast] Failed to send initial progress message: {e}")
-            # Continue anyway - we'll try to send final stats
+            # Try once more after a short delay
+            try:
+                time.sleep(0.5)
+                progress_msg = current_bot.send_message(user_id, initial_text, timeout=10)
+                print(f"[Broadcast] Initial progress message sent on retry")
+            except Exception as e2:
+                print(f"[Broadcast] Failed to send initial progress message on retry: {e2}")
+                # Continue anyway - we'll try to send final stats
         
-        # Progress update callback
+        # Progress update callback with fallback
+        progress_update_failures = 0
         def update_progress(sent, failed, total):
-            """Update progress message periodically"""
-            if progress_msg:
+            """Update progress message periodically with fallback to new message if edit fails"""
+            nonlocal progress_msg, progress_update_failures
+            if not progress_msg:
+                return
+            
+            try:
+                progress_text = f"📤 Отправка рассылки {type_names.get(broadcast_type, '')}...\n"
+                progress_text += f"Получателей: {total}\n"
+                progress_text += f"✅ Отправлено: {sent}\n"
+                progress_text += f"❌ Ошибок: {failed}\n"
+                progress_text += f"⏳ Осталось: {total - sent - failed}"
+                
+                # Try to edit existing message
                 try:
-                    progress_text = f"📤 Отправка рассылки {type_names.get(broadcast_type, '')}...\n"
-                    progress_text += f"Получателей: {total}\n"
-                    progress_text += f"✅ Отправлено: {sent}\n"
-                    progress_text += f"❌ Ошибок: {failed}\n"
-                    progress_text += f"⏳ Осталось: {total - sent - failed}"
                     current_bot.edit_message_text(
                         progress_text,
                         chat_id=progress_msg.chat.id,
-                        message_id=progress_msg.message_id
+                        message_id=progress_msg.message_id,
+                        timeout=5
                     )
-                except Exception as e:
-                    # If editing fails, don't spam errors - just log
-                    pass
+                    progress_update_failures = 0  # Reset failure counter on success
+                except Exception as edit_error:
+                    progress_update_failures += 1
+                    # If edit fails multiple times, send a new message and update progress_msg
+                    if progress_update_failures >= 3:
+                        try:
+                            # Send new progress message
+                            new_msg = current_bot.send_message(user_id, progress_text, timeout=5)
+                            progress_msg = new_msg
+                            progress_update_failures = 0
+                            print(f"[Broadcast] Switched to new progress message after {progress_update_failures} edit failures")
+                        except Exception as send_error:
+                            # If sending also fails, just log and continue
+                            if sent % 50 == 0:  # Log only occasionally
+                                print(f"[Broadcast] Both edit and send failed for progress update: {send_error}")
+                    else:
+                        # Log occasionally if edit fails but we haven't switched yet
+                        if sent % 50 == 0:
+                            print(f"[Broadcast] Progress edit failed (failures={progress_update_failures}): {edit_error}")
+            except Exception as e:
+                # Catch-all for any other errors in progress update
+                if sent % 50 == 0:
+                    print(f"[Broadcast] Progress update error: {e}")
         
         # Send messages with progress updates
-        sent, failed = send_broadcast_messages(recipients, text, photo, progress_callback=update_progress)
+        print(f"[Broadcast] Starting to send {len(recipients)} messages...")
+        try:
+            sent, failed = send_broadcast_messages(recipients, text, current_bot, photo, progress_callback=update_progress)
+            print(f"[Broadcast] Broadcast completed: sent={sent}, failed={failed}, total={len(recipients)}")
+        except Exception as send_error:
+            print(f"[Broadcast] Critical error during message sending: {send_error}")
+            import traceback
+            traceback.print_exc()
+            # Try to notify admin
+            try:
+                current_bot.send_message(user_id, f"❌ Критическая ошибка при отправке рассылки: {str(send_error)[:200]}")
+            except:
+                pass
+            # Set sent/failed to 0 to indicate failure
+            sent = 0
+            failed = len(recipients)
         
-        # Show final statistics
+        # Show final statistics (always try to send, even if broadcast failed)
         stats_text = f"📊 Статистика рассылки:\n\n"
         stats_text += f"✅ Отправлено: {sent}\n"
         stats_text += f"❌ Не удалось отправить: {failed}\n"
         stats_text += f"📊 Всего получателей: {len(recipients)}"
         
-        # Try to edit progress message, fallback to new message if fails
+        # Try multiple methods to send final statistics
+        stats_sent = False
         if progress_msg:
+            # Method 1: Try to edit progress message
             try:
-                current_bot.edit_message_text(stats_text, chat_id=progress_msg.chat.id, message_id=progress_msg.message_id)
+                current_bot.edit_message_text(
+                    stats_text, 
+                    chat_id=progress_msg.chat.id, 
+                    message_id=progress_msg.message_id,
+                    timeout=10
+                )
+                print(f"[Broadcast] Final statistics updated successfully via edit")
+                stats_sent = True
             except Exception as e:
                 print(f"[Broadcast] Failed to edit final progress message: {e}")
-                # Fallback: send new message with statistics
-                try:
-                    current_bot.send_message(user_id, stats_text)
-                except Exception as e2:
-                    print(f"[Broadcast] Failed to send final stats message: {e2}")
-        else:
-            # No progress message existed, send stats as new message
+        
+        # Method 2: If edit failed or no progress_msg, send new message
+        if not stats_sent:
             try:
-                current_bot.send_message(user_id, stats_text)
+                current_bot.send_message(user_id, stats_text, timeout=10)
+                print(f"[Broadcast] Final statistics sent as new message")
+                stats_sent = True
             except Exception as e:
-                print(f"[Broadcast] Failed to send stats message: {e}")
+                print(f"[Broadcast] Failed to send final stats message: {e}")
+                # Last resort: try one more time after a short delay
+                try:
+                    time.sleep(1)
+                    current_bot.send_message(user_id, stats_text, timeout=10)
+                    print(f"[Broadcast] Final statistics sent on retry")
+                    stats_sent = True
+                except Exception as e2:
+                    print(f"[Broadcast] Failed to send stats message even on retry: {e2}")
+        
+        if not stats_sent:
+            print(f"[Broadcast] WARNING: Could not send final statistics to admin")
     
     except Exception as e:
         print(f"[Broadcast] Unexpected error in execute_broadcast: {e}")
         import traceback
         traceback.print_exc()
         try:
-            current_bot.send_message(user_id, f"❌ Произошла ошибка при выполнении рассылки: {e}")
+            error_notification = f"❌ Произошла ошибка при выполнении рассылки: {str(e)[:200]}"
+            current_bot.send_message(user_id, error_notification, timeout=10)
         except Exception as e2:
             print(f"[Broadcast] Failed to send error notification: {e2}")
     
     finally:
-        # Always clear state, even on error
-        if user_id in broadcast_state:
-            del broadcast_state[user_id]
+        # Always clear state, even on error (critical to prevent state leaks)
+        try:
+            if user_id in broadcast_state:
+                del broadcast_state[user_id]
+                print(f"[Broadcast] Broadcast state cleared for user {user_id}")
+        except Exception as e:
+            print(f"[Broadcast] Error clearing broadcast state: {e}")
 
 
 def remove_user_from_channel(user_id: int, channel_id: str):
