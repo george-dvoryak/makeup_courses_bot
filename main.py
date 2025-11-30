@@ -547,16 +547,35 @@ def rub_str(rub: float) -> str:
 
 # Prodamus signature verification
 def verify_prodamus_signature(raw_payload, secret_key: str, signature: str) -> bool:
-    """Verify Prodamus webhook signature using raw POST payload."""
+    """
+    Verify Prodamus webhook signature.
+
+    The official algorithm (and prodamuspy helper) requires:
+    1. Parsing the webhook body into key/value pairs (php style arrays supported)
+    2. Serializing the dict to JSON with sorted keys & compact separators
+    3. Calculating HMAC-SHA256 of that JSON using the shared secret.
+    """
     if not secret_key or not signature:
         return False
+
     try:
-        if raw_payload is None:
-            raw_payload = b""
-        if isinstance(raw_payload, str):
-            raw_payload = raw_payload.encode('utf-8')
-        secret = secret_key.encode('utf-8')
-        expected = hmac.new(secret, raw_payload, hashlib.sha256).hexdigest()
+        client = get_prodamus_client(secret_key)
+
+        if isinstance(raw_payload, dict):
+            payload = raw_payload
+        else:
+            if raw_payload is None:
+                raw_text = ""
+            elif isinstance(raw_payload, bytes):
+                raw_text = raw_payload.decode("utf-8", errors="ignore")
+            else:
+                raw_text = str(raw_payload)
+            payload = parse_prodamus_payload(raw_text, secret_key)
+
+        if not payload:
+            return False
+
+        expected = client.sign(payload)
         provided = signature.strip().lower()
         return hmac.compare_digest(expected, provided)
     except Exception as e:
