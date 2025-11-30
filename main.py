@@ -321,35 +321,57 @@ def parse_prodamus_payload(raw_payload: str, secret_key: str) -> dict:
 
 def extract_prodamus_payload(req, secret_key: str) -> dict:
     """
-    Extract Prodamus payload from a Flask request using raw body, query string,
-    or JSON/form fallbacks.
+    Extract Prodamus payload from a Flask request.
+    
+    According to Prodamus documentation, webhook sends data as 
+    application/x-www-form-urlencoded in POST body. We need to parse
+    the raw body as query string (URL-encoded format) using prodamuspy.
     """
-    raw_sources = []
+    client = get_prodamus_client(secret_key)
+    
+    # Priority 1: Parse raw POST body as query string (official Prodamus format)
     try:
         raw_body = req.get_data(as_text=True)
-    except Exception:
-        raw_body = ""
-    if raw_body:
-        raw_sources.append(raw_body)
-    query_string = ""
+        if raw_body:
+            try:
+                payload = client.parse(raw_body)
+                if payload:
+                    return payload
+            except Exception as e:
+                print(f"[Prodamus] Failed to parse raw body via prodamuspy: {e}")
+    except Exception as e:
+        print(f"[Prodamus] Failed to get raw body: {e}")
+    
+    # Priority 2: Try query string
     try:
         query_string = req.query_string.decode('utf-8', errors='ignore')
+        if query_string:
+            try:
+                payload = client.parse(query_string)
+                if payload:
+                    return payload
+            except Exception:
+                pass
     except Exception:
-        query_string = ""
-    if query_string:
-        raw_sources.append(query_string)
-    for raw in raw_sources:
-        payload = parse_prodamus_payload(raw, secret_key)
-        if payload:
-            return payload
+        pass
+    
+    # Priority 3: Fallback to Flask's parsed form data (may not work for signature verification)
+    if req.form:
+        form_dict = req.form.to_dict(flat=True)
+        if form_dict:
+            print("[Prodamus] Using Flask form data (fallback - signature may fail)")
+            return form_dict
+    
+    # Priority 4: Try JSON
     if req.is_json:
         data = req.get_json(silent=True) or {}
-        if isinstance(data, dict):
+        if isinstance(data, dict) and data:
             return data
-    if req.form:
-        return req.form.to_dict(flat=True)
+    
+    # Priority 5: Try query args
     if req.args:
         return req.args.to_dict(flat=True)
+    
     return {}
 
 def resolve_prodamus_payment_link(long_url: str) -> str:
@@ -546,40 +568,45 @@ def rub_str(rub: float) -> str:
     return f"{float(rub):.2f}"
 
 # Prodamus signature verification
-def verify_prodamus_signature(raw_payload, secret_key: str, signature: str) -> bool:
+def verify_prodamus_signature(payload: dict, secret_key: str, signature: str) -> bool:
     """
-    Verify Prodamus webhook signature.
-
-    The official algorithm (and prodamuspy helper) requires:
-    1. Parsing the webhook body into key/value pairs (php style arrays supported)
-    2. Serializing the dict to JSON with sorted keys & compact separators
-    3. Calculating HMAC-SHA256 of that JSON using the shared secret.
+    Verify Prodamus webhook signature using official prodamuspy library.
+    
+    According to Prodamus documentation:
+    - Payload should be parsed dict from POST data (via parse_prodamus_payload)
+    - Signature comes from 'Sign' header
+    - Uses client.verify(payload_dict, signature) method
+    
+    Args:
+        payload: Parsed dict from POST request (already parsed via extract_prodamus_payload)
+        secret_key: Prodamus secret key for this bot
+        signature: Signature from 'Sign' header
+    
+    Returns:
+        True if signature is valid, False otherwise
     """
     if not secret_key or not signature:
+        print(f"[Prodamus] Missing secret_key or signature: secret_key={bool(secret_key)}, signature={bool(signature)}")
+        return False
+
+    if not payload:
+        print(f"[Prodamus] Empty payload")
         return False
 
     try:
         client = get_prodamus_client(secret_key)
-
-        if isinstance(raw_payload, dict):
-            payload = raw_payload
-        else:
-            if raw_payload is None:
-                raw_text = ""
-            elif isinstance(raw_payload, bytes):
-                raw_text = raw_payload.decode("utf-8", errors="ignore")
-            else:
-                raw_text = str(raw_payload)
-            payload = parse_prodamus_payload(raw_text, secret_key)
-
-        if not payload:
-            return False
-
-        expected = client.sign(payload)
-        provided = signature.strip().lower()
-        return hmac.compare_digest(expected, provided)
+        is_valid = client.verify(payload, signature)
+        
+        if not is_valid:
+            # Debug: show what we're comparing
+            expected_sign = client.sign(payload)
+            print(f"[Prodamus] Signature mismatch: expected={expected_sign}, provided={signature.strip().lower()}")
+        
+        return is_valid
     except Exception as e:
         print(f"[Prodamus] Signature verification error: {e}")
+        import traceback
+        traceback.print_exc()
         return False
 
 def generate_prodamus_payment_url(order_number: str, amount: float, product_name: str, customer_email: str = "", customer_phone: str = "", extra_params: dict = None) -> str:
@@ -869,7 +896,8 @@ def prodamus_result():
         payment_config = get_current_payment_config()
         secret_key = payment_config.get('PRODAMUS_SECRET_KEY', "")
         signature = request.headers.get("Sign") or request.headers.get("sign") or ""
-        raw_body = request.get_data(cache=True, as_text=False)
+        
+        # Parse payload from POST request
         data = extract_prodamus_payload(request, secret_key)
 
         if not data:
@@ -878,13 +906,18 @@ def prodamus_result():
 
         print(f"[Prodamus Result] Headers: {dict(request.headers)}")
         print(f"[Prodamus Result] Payload: {data}")
+        print(f"[Prodamus Result] Signature header: {signature}")
+        print(f"[Prodamus Result] Secret key present: {bool(secret_key)}")
 
         forward_to_test_webhook("result", data, request.method)
         
+        # Verify signature using parsed payload dict (as per Prodamus documentation)
         if secret_key:
-            if not verify_prodamus_signature(raw_body, secret_key, signature):
+            if not verify_prodamus_signature(data, secret_key, signature):
                 print("[Prodamus Result] Invalid signature")
                 return "ERROR: Invalid signature", 400
+            else:
+                print("[Prodamus Result] ✅ Signature verified")
         
         order_number = data.get("order_num") or data.get("order_id") or data.get("order")
         amount = data.get("sum") or data.get("amount")

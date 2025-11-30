@@ -340,7 +340,17 @@ for bot_name in bots.keys():
             try:
                 secret_key = config.get('PRODAMUS_SECRET_KEY', '')
                 signature = request.headers.get("Sign") or request.headers.get("sign") or ""
-                raw_body = request.get_data(cache=True, as_text=False)
+                
+                # Debug: log raw body for signature verification
+                try:
+                    raw_body_debug = request.get_data(as_text=True)
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Raw body length: {len(raw_body_debug) if raw_body_debug else 0}", file=sys.stderr)
+                    if raw_body_debug:
+                        print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Raw body preview (first 200 chars): {raw_body_debug[:200]}", file=sys.stderr)
+                except Exception as e:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Could not get raw body: {e}", file=sys.stderr)
+                
+                # Parse payload from POST request
                 data = extract_prodamus_payload(request, secret_key)
 
                 if not data:
@@ -348,12 +358,20 @@ for bot_name in bots.keys():
                     return "ERROR: Empty payload", 400
 
                 print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 📨 Payload: {data}", file=sys.stderr)
+                print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔑 Signature header: {signature}", file=sys.stderr)
+                print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔐 Secret key present: {bool(secret_key)}", file=sys.stderr)
+                if secret_key:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔐 Secret key preview: {secret_key[:10]}...{secret_key[-10:] if len(secret_key) > 20 else ''}", file=sys.stderr)
+                
                 forward_to_test_webhook("result", data, request.method)
 
+                # Verify signature using parsed payload dict (as per Prodamus documentation)
                 if secret_key:
-                    if not verify_prodamus_signature(raw_body, secret_key, signature):
+                    if not verify_prodamus_signature(data, secret_key, signature):
                         print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Invalid signature", file=sys.stderr)
                         return "ERROR: Invalid signature", 400
+                    else:
+                        print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ✅ Signature verified", file=sys.stderr)
 
                 order_number = data.get("order_num") or data.get("order_id") or data.get("order")
                 amount = data.get("sum") or data.get("amount")
