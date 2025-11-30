@@ -713,14 +713,22 @@ def send_catalog_message(user_id: int, edit_message: telebot.types.Message = Non
             pass
         kb.add(types.InlineKeyboardButton(label[:64], callback_data=f"course_{course_id}"))
     text = intro_text
-    target_chat = edit_chat_id or (edit_message.chat.id if edit_message else None)
-    target_msg = edit_message_id or (edit_message.message_id if edit_message else None)
-    if target_chat and target_msg:
+
+    # Delete previous message if provided
+    message_chat_id = None
+    message_id = None
+    if edit_message:
+        message_chat_id = edit_message.chat.id
+        message_id = edit_message.message_id
+    elif edit_chat_id and edit_message_id:
+        message_chat_id = edit_chat_id
+        message_id = edit_message_id
+
+    if message_chat_id and message_id:
         try:
-            current_bot.edit_message_text(text, chat_id=target_chat, message_id=target_msg, reply_markup=kb, parse_mode='HTML')
-            return
+            current_bot.delete_message(chat_id=message_chat_id, message_id=message_id)
         except Exception as e:
-            print(f"Failed to edit catalog message: {e}")
+            print(f"[Catalog] Failed to delete previous message: {e}")
 
     # Отправляем картинку каталога, если указана
     if catalog_image_url:
@@ -1278,6 +1286,22 @@ def cb_course(c: telebot.types.CallbackQuery):
     print(f"[Course Detail] ID: {course_id}, Name: {name[:30] if name else 'N/A'}")
     print(f"[Course Detail] Image URL: '{image_url}' (length: {len(image_url) if image_url else 0})")
 
+    original_chat_id = c.message.chat.id if c.message else None
+    original_message_id = c.message.message_id if c.message else None
+    original_deleted = False
+
+    def delete_original_message():
+        nonlocal original_deleted
+        if original_deleted:
+            return
+        if original_chat_id and original_message_id:
+            try:
+                current_bot.delete_message(chat_id=original_chat_id, message_id=original_message_id)
+            except Exception as e:
+                print(f"[Catalog] Failed to delete original message: {e}")
+            finally:
+                original_deleted = True
+
     # Strip all HTML from course name and escape HTML special characters for safe use in HTML markup
     formatted_name = escape_html(strip_html(name)) if name else "Курс"
 
@@ -1311,11 +1335,12 @@ def cb_course(c: telebot.types.CallbackQuery):
                 if invite_link:
                     ikb.add(types.InlineKeyboardButton("Перейти в канал курса", url=invite_link))
         ikb.add(types.InlineKeyboardButton("⬅️ Назад к каталогу", callback_data="back_to_catalog"))
+        delete_original_message()
         try:
-            if c.message.content_type == "photo":
-                current_bot.edit_message_caption(chat_id=c.message.chat.id, message_id=c.message.message_id, caption=text, reply_markup=ikb, parse_mode='HTML')
+            if image_url:
+                send_image_safe(current_bot, user_id, image_url, caption=text, reply_markup=ikb, parse_mode='HTML')
             else:
-                current_bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb, parse_mode='HTML')
+                current_bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
         except Exception:
             current_bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
         current_bot.answer_callback_query(c.id)
@@ -1341,66 +1366,30 @@ def cb_course(c: telebot.types.CallbackQuery):
         ikb.add(types.InlineKeyboardButton("Купить (ЮKassa)", callback_data=f"pay_yk_{course_id}"))
     ikb.add(types.InlineKeyboardButton("⬅️ Назад к каталогу", callback_data="back_to_catalog"))
     
-    # Try to edit existing message first, then fallback to sending new message
+    delete_original_message()
     message_sent = False
     try:
         if image_url:
-            # If course has image, try to edit message media (if original was photo) or send new photo
-            if c.message.content_type == "photo":
-                # Try to edit photo
-                try:
-                    current_bot.edit_message_media(
-                        chat_id=c.message.chat.id,
-                        message_id=c.message.message_id,
-                        media=types.InputMediaPhoto(image_url, caption=text, parse_mode='HTML'),
-                        reply_markup=ikb
-                    )
-                    current_bot.answer_callback_query(c.id)
-                    return
-                except Exception as e:
-                    # If edit fails, delete old message and send new one
-                    print(f"Failed to edit message media: {e}")
-                    try:
-                        current_bot.delete_message(chat_id=c.message.chat.id, message_id=c.message.message_id)
-                    except Exception:
-                        pass
-            # Send new photo (either because original wasn't photo, or edit/delete failed)
             send_image_safe(current_bot, user_id, image_url, caption=text, reply_markup=ikb, parse_mode='HTML')
-            message_sent = True
         else:
-            # No course image - edit text or send new message
-            if c.message.content_type == "photo":
-                # Original was photo, but course has no image - send text message
-                current_bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
-                message_sent = True
-            else:
-                # Original was text - can edit
-                try:
-                    current_bot.edit_message_text(text, chat_id=c.message.chat.id, message_id=c.message.message_id, reply_markup=ikb, parse_mode='HTML')
-                    message_sent = True
-                except Exception as e:
-                    print(f"Failed to edit message text: {e}")
-                    # If edit fails, send new message
-                    current_bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
-                    message_sent = True
-        current_bot.answer_callback_query(c.id)
+            current_bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
+        message_sent = True
     except Exception as e:
-        # Fallback: send text message if everything else fails (only if we haven't sent anything yet)
         print(f"Error in course handler: {e}")
         if not message_sent:
             current_bot.send_message(user_id, text, reply_markup=ikb, parse_mode='HTML')
-        current_bot.answer_callback_query(c.id)
+    current_bot.answer_callback_query(c.id)
 
 @bot.callback_query_handler(func=lambda c: c.data == "back_to_catalog")
 def cb_back_to_catalog(c: telebot.types.CallbackQuery):
     current_bot = get_current_bot()
     user_id = c.from_user.id
-    send_catalog_message(
-        user_id,
-        edit_message=c.message,
-        edit_message_id=c.message.message_id,
-        edit_chat_id=c.message.chat.id
-    )
+    if c.message:
+        try:
+            current_bot.delete_message(chat_id=c.message.chat.id, message_id=c.message.message_id)
+        except Exception as e:
+            print(f"[Catalog] Failed to delete course message: {e}")
+    send_catalog_message(user_id)
     current_bot.answer_callback_query(c.id)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("buy_"))
