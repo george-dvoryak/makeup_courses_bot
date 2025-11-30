@@ -220,15 +220,19 @@ def format_text_for_telegram(text: str) -> str:
     """
     Convert Google Sheets formatting to Telegram HTML format.
     Protects valid HTML tags and escapes others.
+    Converts literal \n to actual newlines.
     """
     if not text:
         return ""
-    
+
+    # Convert literal \n to actual newlines (for Google Sheets compatibility)
+    text = text.replace('\\n', '\n')
+
     # Protect valid HTML tags (opening and closing)
     # Pattern matches: <tag>, <tag attr="value">, </tag>
     protected = []
     tag_pattern = r'<(/?)([a-zA-Z][a-zA-Z0-9]*)(?:\s[^>]*)?>'
-    
+
     def protect_tag(match):
         tag_name = match.group(2).lower()
         # List of valid Telegram HTML tags
@@ -238,17 +242,17 @@ def format_text_for_telegram(text: str) -> str:
             protected.append(match.group(0))
             return tag_id
         return match.group(0)
-    
+
     # Protect valid tags
     text = re.sub(tag_pattern, protect_tag, text)
-    
+
     # Escape all remaining HTML
     text = escape_html(text)
-    
+
     # Restore protected tags
     for i, tag in enumerate(protected):
         text = text.replace(f"__PROTECTED_TAG_{i}__", tag)
-    
+
     return text
 
 # Payment helper functions
