@@ -407,6 +407,26 @@ def resolve_prodamus_payment_link(long_url: str) -> str:
         traceback.print_exc()
         return long_url
 
+
+def decode_order_metadata(order_number: str):
+    """
+    Extract user_id and course_id from generated Prodamus order numbers.
+    Format: PROD-{timestamp}{ms}-{user_id}-{course_id}
+    Returns tuple (user_id:int, course_id:str) or (None, None) if parsing fails.
+    """
+    if not order_number or not order_number.startswith("PROD-"):
+        return None, None
+    parts = order_number.split("-")
+    if len(parts) < 4:
+        return None, None
+    user_part = parts[-2]
+    course_part = parts[-1]
+    try:
+        user_id = int(user_part)
+    except (TypeError, ValueError):
+        return None, None
+    return user_id, course_part
+
 # In-memory state for Prodamus email collection (per bot)
 # Format: {bot_name: {user_id: {"course_id": course_id, "order_id": order_id, "price": price, "name": name}}}
 prodamus_pending_emails = {}
@@ -876,15 +896,24 @@ def prodamus_result():
             cur.execute("SELECT user_id, course_id, amount FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
             row = cur.fetchone()
             
-            if not row:
-                print(f"[Prodamus Result] Payment not found for order/invoice {order_number}")
+            cleanup_conn = conn
+            if row:
+                user_id, course_id, expected_amount = row
+                expected_amount = float(expected_amount)
+            else:
+                cleanup_conn = None
                 conn.close()
-                return "ERROR: Payment not found", 404
+                user_id, course_id = decode_order_metadata(order_number)
+                if user_id is None or course_id is None:
+                    print(f"[Prodamus Result] Payment not found for order/invoice {order_number}")
+                    return "ERROR: Payment not found", 404
+                expected_amount = float(amount)
+                print(f"[Prodamus Result] Pending payment missing for {order_number}, using encoded metadata (user={user_id}, course={course_id})")
             
-            user_id, course_id, expected_amount = row
             if abs(float(amount) - float(expected_amount)) > 0.01:
+                if cleanup_conn:
+                    cleanup_conn.close()
                 print(f"[Prodamus Result] Amount mismatch for order {order_number}: expected {expected_amount}, got {amount}")
-                conn.close()
                 return "ERROR: Amount mismatch", 400
             
             try:
@@ -902,10 +931,12 @@ def prodamus_result():
                 add_user(user_id, None)
                 
                 add_purchase(user_id, str(course_id), course_name, channel, duration, payment_id=f"prodamus_{order_number}")
-
-                cur.execute("DELETE FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
-                conn.commit()
-                conn.close()
+                
+                if cleanup_conn:
+                    cleanup_cur = cleanup_conn.cursor()
+                    cleanup_cur.execute("DELETE FROM pending_payments WHERE order_id = ? OR invoice_id = ?", (order_number, order_number))
+                    cleanup_conn.commit()
+                    cleanup_conn.close()
                 
                 clean_course_name = strip_html(course_name) if course_name else f"ID {course_id}"
                 text = f"✅ Оплата успешно получена!\n\nВам предоставлен доступ к курсу: {clean_course_name}"
