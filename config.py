@@ -20,6 +20,44 @@ def get_bool_env(key: str, default: bool = False) -> bool:
 # This allows running multiple bots in the same application
 CURRENT_BOT_NAME = os.getenv("BOT_NAME", "default")
 
+
+def _is_placeholder_token(token: str) -> bool:
+    """Detect placeholder tokens like 'ваш_токен' or empty values."""
+    if not token:
+        return True
+    token_str = str(token).strip()
+    if not token_str:
+        return True
+    lowered = token_str.lower()
+    return "ваш" in lowered or "your" in lowered
+
+
+def _build_minimal_config() -> dict:
+    """Return a minimal safe config when no valid bot configuration is available."""
+    return {
+        'TELEGRAM_BOT_TOKEN': '',
+        'ADMIN_IDS': [],
+        'DATABASE_PATH': 'bot.db',
+        'PAYMENT_PROVIDER_TOKEN': '',
+        'CURRENCY': 'RUB',
+        'ENABLE_PRODAMUS': False,
+        'PRODAMUS_TEST_MODE': False,
+        'PRODAMUS_PAYFORM_URL': '',
+        'PRODAMUS_SECRET_KEY': '',
+        'PRODAMUS_SYSTEM_ID': '',
+        'PRODAMUS_TEST_WEBHOOK_URL': '',
+        'USE_WEBHOOK': False,
+        'WEBHOOK_HOST': '',
+        'WEBHOOK_SECRET_TOKEN': '',
+        'WEBHOOK_URL': '',
+        'WEBHOOK_PATH': '',
+        'GSHEET_ID': '',
+        'GSHEET_COURSES_NAME': 'Courses',
+        'GSHEET_TEXTS_NAME': 'Texts',
+        'GOOGLE_SHEETS_USE_API': False,
+        'GOOGLE_CREDENTIALS_FILE': 'google_credentials.json',
+    }
+
 # Dictionary to store bot configurations
 _bot_configs = {}
 
@@ -156,41 +194,30 @@ def get_available_bots() -> list:
 
 # Get configuration for current bot (for backward compatibility)
 # Try to load default bot, fallback to first available bot if default doesn't exist or has invalid config
-try:
-    _current_config = get_bot_config(CURRENT_BOT_NAME)
-    # Validate that config has valid token (not a placeholder)
-    if not _current_config.get('TELEGRAM_BOT_TOKEN') or 'ваш' in _current_config.get('TELEGRAM_BOT_TOKEN', '').lower():
-        raise ValueError("Default bot has placeholder values")
-except (ValueError, KeyError):
-    # Fallback to first available bot
-    available_bots = get_available_bots()
-    if available_bots:
-        _current_config = get_bot_config(available_bots[0])
-    else:
-        # Last resort: create minimal config
-        _current_config = {
-            'TELEGRAM_BOT_TOKEN': '',
-            'ADMIN_IDS': [],
-            'DATABASE_PATH': 'bot.db',
-            'PAYMENT_PROVIDER_TOKEN': '',
-            'CURRENCY': 'RUB',
-            'ENABLE_PRODAMUS': False,
-            'PRODAMUS_TEST_MODE': False,
-            'PRODAMUS_PAYFORM_URL': '',
-            'PRODAMUS_SECRET_KEY': '',
-            'PRODAMUS_SYSTEM_ID': '',
-            'PRODAMUS_TEST_WEBHOOK_URL': '',
-            'USE_WEBHOOK': False,
-            'WEBHOOK_HOST': '',
-            'WEBHOOK_SECRET_TOKEN': '',
-            'WEBHOOK_URL': '',
-            'WEBHOOK_PATH': '',
-            'GSHEET_ID': '',
-            'GSHEET_COURSES_NAME': 'Courses',
-            'GSHEET_TEXTS_NAME': 'Texts',
-            'GOOGLE_SHEETS_USE_API': False,
-            'GOOGLE_CREDENTIALS_FILE': 'google_credentials.json',
-        }
+def _resolve_current_config() -> dict:
+    """Load the primary configuration, avoiding placeholder tokens."""
+    try:
+        config = get_bot_config(CURRENT_BOT_NAME)
+        if _is_placeholder_token(config.get('TELEGRAM_BOT_TOKEN')):
+            raise ValueError("Default bot has placeholder values")
+        return config
+    except (ValueError, KeyError):
+        valid_config = None
+        for bot_name in get_available_bots():
+            try:
+                candidate = get_bot_config(bot_name)
+            except Exception:
+                continue
+            if _is_placeholder_token(candidate.get('TELEGRAM_BOT_TOKEN')):
+                continue
+            valid_config = candidate
+            break
+        if valid_config:
+            return valid_config
+        return _build_minimal_config()
+
+
+_current_config = _resolve_current_config()
 
 # Export current bot configuration as module-level variables (for backward compatibility)
 TELEGRAM_BOT_TOKEN = _current_config['TELEGRAM_BOT_TOKEN']

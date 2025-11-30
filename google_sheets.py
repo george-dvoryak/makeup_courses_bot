@@ -214,8 +214,8 @@ def get_texts_data(bot_name: str = None):
         start_idx = 0
         if len(data) > 0 and len(data[0]) >= 2:
             first_cell = str(data[0][0]).strip().lower() if data[0][0] else ""
-            # Check if first row looks like a header
-            if first_cell in ("key", "ключ", "name", "название", "text_key", "ключ_текста"):
+            # Only skip obvious header rows to avoid false positives
+            if first_cell in ("key", "ключ"):
                 print(f"[GSheets] Detected header row, skipping: {data[0]}")
                 start_idx = 1
         
