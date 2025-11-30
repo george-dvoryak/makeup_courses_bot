@@ -340,6 +340,7 @@ for bot_name in bots.keys():
             try:
                 secret_key = config.get('PRODAMUS_SECRET_KEY', '')
                 signature = request.headers.get("Sign") or request.headers.get("sign") or ""
+                raw_body = request.get_data(cache=True, as_text=False)
                 data = extract_prodamus_payload(request, secret_key)
 
                 if not data:
@@ -350,7 +351,7 @@ for bot_name in bots.keys():
                 forward_to_test_webhook("result", data, request.method)
 
                 if secret_key:
-                    if not verify_prodamus_signature(data, secret_key, signature):
+                    if not verify_prodamus_signature(raw_body, secret_key, signature):
                         print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Invalid signature", file=sys.stderr)
                         return "ERROR: Invalid signature", 400
 

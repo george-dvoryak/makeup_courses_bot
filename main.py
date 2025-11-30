@@ -21,6 +21,7 @@ from db import add_user, get_user, add_purchase, get_active_subscriptions, has_a
 from google_sheets import get_courses_data, get_texts_data
 from bot_context import get_bot_context, set_bot_context
 from bot_factory import get_bot_instance
+import hmac
 from prodamuspy import ProdamusPy  # type: ignore
 
 # Create default bot instance (for backward compatibility)
@@ -545,13 +546,19 @@ def rub_str(rub: float) -> str:
     return f"{float(rub):.2f}"
 
 # Prodamus signature verification
-def verify_prodamus_signature(data: dict, secret_key: str, signature: str) -> bool:
-    """Verify Prodamus webhook signature"""
+def verify_prodamus_signature(raw_payload, secret_key: str, signature: str) -> bool:
+    """Verify Prodamus webhook signature using raw POST payload."""
     if not secret_key or not signature:
         return False
     try:
-        client = get_prodamus_client(secret_key)
-        return client.verify(data, signature)
+        if raw_payload is None:
+            raw_payload = b""
+        if isinstance(raw_payload, str):
+            raw_payload = raw_payload.encode('utf-8')
+        secret = secret_key.encode('utf-8')
+        expected = hmac.new(secret, raw_payload, hashlib.sha256).hexdigest()
+        provided = signature.strip().lower()
+        return hmac.compare_digest(expected, provided)
     except Exception as e:
         print(f"[Prodamus] Signature verification error: {e}")
         return False
@@ -843,6 +850,7 @@ def prodamus_result():
         payment_config = get_current_payment_config()
         secret_key = payment_config.get('PRODAMUS_SECRET_KEY', "")
         signature = request.headers.get("Sign") or request.headers.get("sign") or ""
+        raw_body = request.get_data(cache=True, as_text=False)
         data = extract_prodamus_payload(request, secret_key)
 
         if not data:
@@ -855,7 +863,7 @@ def prodamus_result():
         forward_to_test_webhook("result", data, request.method)
         
         if secret_key:
-            if not verify_prodamus_signature(data, secret_key, signature):
+            if not verify_prodamus_signature(raw_body, secret_key, signature):
                 print("[Prodamus Result] Invalid signature")
                 return "ERROR: Invalid signature", 400
         
