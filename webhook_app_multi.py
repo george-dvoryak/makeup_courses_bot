@@ -459,17 +459,10 @@ for bot_name in bots.keys():
                     print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Secret key missing", file=sys.stderr)
                     return "ERROR: Secret key missing", 400
                 
-                # Use client.verify() method (equivalent to Hmac::verify in PHP)
-                if not client.verify(data, signature):
+                # Use verify_prodamus_signature (implements exact PHP algorithm)
+                from main import verify_prodamus_signature
+                if not verify_prodamus_signature(data, secret_key, signature):
                     print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Invalid signature", file=sys.stderr)
-                    # Debug: show what signature we calculated
-                    calculated_sig = client.sign(data)
-                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Calculated signature: {calculated_sig}", file=sys.stderr)
-                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Provided signature: {signature}", file=sys.stderr)
-                    # Debug: show JSON that was signed
-                    import json
-                    json_data = json.dumps(data, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
-                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 JSON used for signing (first 500 chars): {json_data[:500]}", file=sys.stderr)
                     return "ERROR: Invalid signature", 400
                 else:
                     print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ✅ Signature verified", file=sys.stderr)

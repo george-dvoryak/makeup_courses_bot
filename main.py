@@ -568,11 +568,45 @@ def rub_str(rub: float) -> str:
     return f"{float(rub):.2f}"
 
 # Prodamus signature verification
+def _prodamus_sort_recursive(data):
+    """
+    Recursively sort data structure (equivalent to PHP Hmac::_sort).
+    Sorts dicts by keys and recursively sorts nested structures.
+    """
+    if isinstance(data, dict):
+        # Sort dict by keys
+        sorted_data = {}
+        for key in sorted(data.keys()):
+            sorted_data[key] = _prodamus_sort_recursive(data[key])
+        return sorted_data
+    elif isinstance(data, list):
+        # Recursively sort list elements
+        return [_prodamus_sort_recursive(item) for item in data]
+    else:
+        return data
+
+def _prodamus_convert_to_strings(data):
+    """
+    Recursively convert all values to strings (equivalent to PHP array_walk_recursive).
+    """
+    if isinstance(data, dict):
+        return {k: _prodamus_convert_to_strings(v) for k, v in data.items()}
+    elif isinstance(data, list):
+        return [_prodamus_convert_to_strings(item) for item in data]
+    else:
+        return str(data) if data is not None else ""
+
 def verify_prodamus_signature(payload: dict, secret_key: str, signature: str) -> bool:
     """
-    Verify Prodamus webhook signature using official prodamuspy library.
+    Verify Prodamus webhook signature using exact PHP algorithm.
     
     Equivalent to PHP: Hmac::verify($_POST, $secret_key, $headers['Sign'])
+    
+    Algorithm (from PHP code):
+    1. Convert all values to strings recursively
+    2. Sort data recursively by keys
+    3. JSON encode with JSON_UNESCAPED_UNICODE (ensure_ascii=False)
+    4. Calculate HMAC-SHA256
     
     Args:
         payload: Parsed dict from POST request (parsed via prodamuspy.parse())
@@ -591,14 +625,31 @@ def verify_prodamus_signature(payload: dict, secret_key: str, signature: str) ->
         return False
 
     try:
-        client = get_prodamus_client(secret_key)
-        # Use client.verify() directly (equivalent to Hmac::verify in PHP)
-        is_valid = client.verify(payload, signature)
+        # Step 1: Convert all values to strings (PHP array_walk_recursive)
+        data_str = _prodamus_convert_to_strings(payload)
+        
+        # Step 2: Sort recursively by keys (PHP _sort)
+        data_sorted = _prodamus_sort_recursive(data_str)
+        
+        # Step 3: JSON encode with JSON_UNESCAPED_UNICODE (ensure_ascii=False)
+        json_data = json.dumps(data_sorted, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
+        
+        # Step 4: Calculate HMAC-SHA256
+        expected_signature = hmac.new(
+            secret_key.encode('utf-8'),
+            json_data.encode('utf-8'),
+            hashlib.sha256
+        ).hexdigest()
+        
+        # Compare signatures (case-insensitive)
+        provided_signature = signature.strip().lower()
+        is_valid = hmac.compare_digest(expected_signature.lower(), provided_signature)
         
         if not is_valid:
-            # Debug: show what we're comparing
-            expected_sign = client.sign(payload)
-            print(f"[Prodamus] Signature mismatch: expected={expected_sign}, provided={signature.strip().lower()}")
+            print(f"[Prodamus] Signature mismatch:")
+            print(f"[Prodamus]   Expected: {expected_signature}")
+            print(f"[Prodamus]   Provided: {provided_signature}")
+            print(f"[Prodamus]   JSON (first 500 chars): {json_data[:500]}")
         
         return is_valid
     except Exception as e:
@@ -920,17 +971,14 @@ def prodamus_result():
 
         forward_to_test_webhook("result", data, request.method)
         
-        # Verify signature using client.verify() (equivalent to Hmac::verify in PHP)
+        # Verify signature using verify_prodamus_signature (implements exact PHP algorithm)
         if not signature:
             print("[Prodamus Result] Signature header missing")
             return "ERROR: Signature header missing", 400
         
         if secret_key:
-            if not client.verify(data, signature):
-                calculated_sig = client.sign(data)
-                print(f"[Prodamus Result] Invalid signature")
-                print(f"[Prodamus Result] Calculated: {calculated_sig}")
-                print(f"[Prodamus Result] Provided: {signature}")
+            if not verify_prodamus_signature(data, secret_key, signature):
+                print("[Prodamus Result] Invalid signature")
                 return "ERROR: Invalid signature", 400
             else:
                 print("[Prodamus Result] ✅ Signature verified")
