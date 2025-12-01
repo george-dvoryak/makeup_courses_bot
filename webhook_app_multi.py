@@ -17,6 +17,46 @@ from bot_context import set_bot_context, get_bot_context, clear_bot_context
 
 app = Flask(__name__)
 
+# Store raw POST body for Prodamus webhook signature verification
+# Flask parses form data automatically, but we need raw body for signature verification
+_raw_body_storage = {}
+
+@app.before_request
+def save_raw_body():
+    """Save raw POST body before Flask parses it (for Prodamus signature verification)"""
+    if request.method == 'POST' and request.path.startswith('/prodamus/'):
+        # Only for Prodamus endpoints
+        try:
+            # Try to read from WSGI input stream directly (before Flask parses it)
+            if 'wsgi.input' in request.environ:
+                wsgi_input = request.environ['wsgi.input']
+                # Check if stream is seekable
+                if hasattr(wsgi_input, 'tell') and hasattr(wsgi_input, 'seek'):
+                    # Save current position
+                    pos = wsgi_input.tell()
+                    # Read from beginning
+                    wsgi_input.seek(0)
+                    content_length = request.environ.get('CONTENT_LENGTH', 0)
+                    if content_length:
+                        raw_data = wsgi_input.read(int(content_length))
+                        _raw_body_storage[id(request)] = raw_data.decode('utf-8', errors='ignore')
+                    # Restore position
+                    wsgi_input.seek(pos)
+                else:
+                    # Fallback: use request.get_data (may be empty if already parsed)
+                    raw_data = request.get_data(cache=False)
+                    if raw_data:
+                        _raw_body_storage[id(request)] = raw_data.decode('utf-8', errors='ignore')
+        except Exception as e:
+            print(f"[{datetime.now()}] [RawBody] Failed to save raw body: {e}", file=sys.stderr)
+
+@app.after_request
+def cleanup_raw_body(response):
+    """Clean up stored raw body after request"""
+    if id(request) in _raw_body_storage:
+        del _raw_body_storage[id(request)]
+    return response
+
 # Initialize all bots at startup
 bots = initialize_all_bots()
 print(f"[{datetime.now()}] Initialized {len(bots)} bot(s): {', '.join(bots.keys())}")
@@ -343,24 +383,54 @@ for bot_name in bots.keys():
                 
                 # According to Prodamus PHP documentation: Hmac::verify($_POST, $secret_key, $headers['Sign'])
                 # $_POST in PHP contains parsed form data from application/x-www-form-urlencoded
-                # We need to get raw POST body and parse it using prodamuspy (which handles PHP-style arrays)
+                # Flask's request.form is equivalent to $_POST - it's already parsed
                 
-                # Get raw POST body (URL-encoded string)
-                raw_body = request.get_data(as_text=True, cache=False)
-                
-                if not raw_body:
-                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Empty POST body", file=sys.stderr)
+                if not request.form:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Empty POST data (request.form is empty)", file=sys.stderr)
                     return "ERROR: Empty payload", 400
                 
-                # Parse using prodamuspy (handles PHP-style array notation like products[0][name])
+                # Get raw POST body (saved by before_request middleware)
+                raw_body = _raw_body_storage.get(id(request))
+                
+                # Fallback: try Flask's get_data
+                if not raw_body:
+                    raw_body = request.get_data(as_text=True, cache=False)
+                
                 from main import get_prodamus_client
                 client = get_prodamus_client(secret_key)
                 
-                try:
-                    data = client.parse(raw_body)
-                except Exception as e:
-                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Failed to parse payload: {e}", file=sys.stderr)
-                    return "ERROR: Failed to parse payload", 400
+                # Try to parse raw body first (handles PHP-style arrays correctly)
+                if raw_body:
+                    try:
+                        data = client.parse(raw_body)
+                        if data:
+                            print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 📝 Parsed from raw body", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Failed to parse raw body: {e}, trying request.form", file=sys.stderr)
+                        data = None
+                else:
+                    data = None
+                
+                # Fallback: reconstruct query string from request.form and parse it
+                if not data:
+                    # Reconstruct query string from form data for parsing
+                    from urllib.parse import quote
+                    query_parts = []
+                    for key, value in request.form.items():
+                        # URL-encode the value
+                        encoded_value = quote(str(value), safe='')
+                        query_parts.append(f"{key}={encoded_value}")
+                    query_string = "&".join(query_parts)
+                    
+                    try:
+                        data = client.parse(query_string)
+                        if data:
+                            print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 📝 Parsed from reconstructed query string", file=sys.stderr)
+                    except Exception as e:
+                        print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Failed to parse reconstructed query: {e}", file=sys.stderr)
+                        # Last resort: use form dict directly (may not work for arrays)
+                        data = request.form.to_dict(flat=True)
+                        print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ⚠️ Using request.form directly (arrays may not work)", file=sys.stderr)
 
                 if not data:
                     print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ❌ Empty payload after parsing", file=sys.stderr)
@@ -369,6 +439,10 @@ for bot_name in bots.keys():
                 print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 📨 Payload: {data}", file=sys.stderr)
                 print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔑 Signature header: {signature}", file=sys.stderr)
                 print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔐 Secret key present: {bool(secret_key)}", file=sys.stderr)
+                
+                # Debug: log raw body for troubleshooting
+                if raw_body:
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Raw body length: {len(raw_body)}, preview: {raw_body[:200]}", file=sys.stderr)
                 
                 forward_to_test_webhook("result", data, request.method)
 
@@ -389,6 +463,10 @@ for bot_name in bots.keys():
                     calculated_sig = client.sign(data)
                     print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Calculated signature: {calculated_sig}", file=sys.stderr)
                     print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 Provided signature: {signature}", file=sys.stderr)
+                    # Debug: show JSON that was signed
+                    import json
+                    json_data = json.dumps(data, ensure_ascii=False, separators=(',', ':'), sort_keys=True)
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔍 JSON used for signing (first 500 chars): {json_data[:500]}", file=sys.stderr)
                     return "ERROR: Invalid signature", 400
                 else:
                     print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] ✅ Signature verified", file=sys.stderr)
