@@ -439,6 +439,9 @@ for bot_name in bots.keys():
                 print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 📨 Payload: {data}", file=sys.stderr)
                 print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔑 Signature header: {signature}", file=sys.stderr)
                 print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔐 Secret key present: {bool(secret_key)}", file=sys.stderr)
+                if secret_key:
+                    # Log first and last 10 chars of secret key for verification (without exposing full key)
+                    print(f"[{datetime.now()}] [Prodamus-{bot_name} Result] 🔐 Secret key: {secret_key[:10]}...{secret_key[-10:] if len(secret_key) > 20 else ''} (length: {len(secret_key)})", file=sys.stderr)
                 
                 # Debug: log raw body for troubleshooting
                 if raw_body:
